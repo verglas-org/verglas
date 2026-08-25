@@ -36,3 +36,4 @@
   JSON, enforces the inclusive 5 MiB UTF-8 request ceiling, and routes only the
   exact WIT Stream append request without fallback; manifest, mock-host, and
   component verification coverage documents the protocol judgment.
+- #0: Added the PP4 Durable Object Stream path: handler environments route `send(records)` through WIT `storage.stream-send` for transactional staging, while Worker environments retain direct Stream ingestion. The Python transport exposes only JSON-row SQL and has no Arrow IPC compatibility surface.

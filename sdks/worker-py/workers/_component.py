@@ -37,6 +37,7 @@ from ._runtime import (
 
 _project_module: ModuleType | None = None
 _binding_records: list[dict[str, str]] = []
+_pipeline_records: list[dict[str, str]] = []
 _variables: dict[str, Any] = {}
 _storage = Storage(storage_imports, socket_imports)
 _environment: Environment | None = None
@@ -53,9 +54,10 @@ def set_project(
     pipeline_records: list[dict[str, str]] | None = None,
 ) -> None:
     """Configure the imported project and its validated Wrangler bindings."""
-    global _project_module, _binding_records, _variables, _environment
+    global _project_module, _binding_records, _pipeline_records, _variables, _environment
     _project_module = module
     _binding_records = list(binding_records)
+    _pipeline_records = list(pipeline_records or [])
     _variables = dict(variables)
     _environment = Environment(
         _storage,
@@ -177,7 +179,16 @@ def _ensure_object() -> DurableObject:
     if _environment is None:
         raise RuntimeError("Python Worker environment was not configured")
     _object_state = DurableObjectState(_storage, socket_imports)
-    _object_instance = object_class(_object_state, _environment)
+    object_environment = Environment(
+        _storage,
+        socket_imports,
+        binding_imports,
+        _variables,
+        _binding_records,
+        _pipeline_records,
+        transactional_streams=True,
+    )
+    _object_instance = object_class(_object_state, object_environment)
     if not isinstance(_object_instance, DurableObject):
         raise TypeError(f"declared Durable Object {class_name} did not construct correctly")
     return _object_instance

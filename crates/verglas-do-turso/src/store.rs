@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as JsonValue;
@@ -112,6 +112,8 @@ pub struct TursoStore {
     event_lock: Arc<Mutex<()>>,
     /// Optional Stream binding injected by the product composition layer.
     appender: Arc<RwLock<Option<StreamAppenderHandle>>>,
+    /// Prevents a connection-local router from replacing an explicit appender.
+    appender_external: Arc<RwLock<bool>>,
 }
 
 impl TursoStore {
@@ -188,6 +190,7 @@ impl TursoStore {
             connection: Arc::new(Mutex::new(connection)),
             event_lock: Arc::new(Mutex::new(())),
             appender: Arc::new(RwLock::new(None)),
+            appender_external: Arc::new(RwLock::new(false)),
         })
     }
 
@@ -201,9 +204,28 @@ impl TursoStore {
         self.local_path.as_path()
     }
 
-    /// Installs the Stream binding used for transactional outbox delivery.
+    /// Installs an explicit product Stream binding for transactional outbox delivery.
     pub async fn set_stream_appender(&self, appender: StreamAppenderHandle) {
+        let mut external = self.appender_external.write().await;
+        *external = true;
         *self.appender.write().await = Some(appender);
+    }
+
+    /// Installs the current connection's real Stream router unless a product
+    /// composition already supplied an explicit appender.
+    pub async fn set_runtime_stream_appender(&self, appender: StreamAppenderHandle) {
+        let external = self.appender_external.write().await;
+        if !*external {
+            *self.appender.write().await = Some(appender);
+        }
+    }
+
+    /// Removes a connection-local appender while preserving explicit product wiring.
+    pub async fn clear_runtime_stream_appender(&self) {
+        let external = self.appender_external.write().await;
+        if !*external {
+            *self.appender.write().await = None;
+        }
     }
 
     /// Pulls remote state while no event transaction is active.
@@ -283,6 +305,7 @@ impl TursoStore {
             backend: self.backend.clone(),
             connection: Arc::clone(&self.connection),
             event_guard,
+            next_record_index: AtomicU32::new(0),
             finished: false,
         })
     }
@@ -313,10 +336,18 @@ impl TursoStore {
 
     /// Delivers all pending outbox records through the injected Stream binding.
     pub async fn drain_outbox(&self) -> Result<()> {
+        let now = now_millis();
+        self.reclaim_expired_outbox(now).await?;
+        if self.has_unexpired_inflight(now).await? {
+            return Err(Error::OutboxInFlight);
+        }
         let pending = self.pending_outbox(256).await?;
         if pending.is_empty() {
             return Ok(());
         }
+        // A prior source commit may have reached local WAL while its push failed;
+        // never append to Stream until this retry reaches Turso's boundary.
+        self.backend.push().await?;
         let appender = self
             .appender
             .read()
@@ -351,7 +382,7 @@ impl TursoStore {
         let connection = self.connection.lock().await;
         let mut statement = connection
             .prepare(
-                "SELECT source_do_id, event_sequence, record_index, payload
+                "SELECT stream_binding, stream_name, source_do_id, event_sequence, record_index, payload
                  FROM __verglas_outbox
                  WHERE state = 'pending'
                  ORDER BY event_sequence, record_index
@@ -361,16 +392,34 @@ impl TursoStore {
         let mut rows = statement.query([i64::from(limit)]).await?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? {
-            let source_do_id = text_value(&row, 0, "outbox source")?;
-            let event_sequence = nonnegative_integer(&row, 1, "outbox sequence")?;
-            let record_index = nonnegative_integer(&row, 2, "outbox record index")?;
-            let payload = text_value(&row, 3, "outbox payload")?;
+            let stream_binding = text_value(&row, 0, "outbox Stream binding")?;
+            let stream_name = text_value(&row, 1, "outbox Stream name")?;
+            let source_do_id = text_value(&row, 2, "outbox source")?;
+            let event_sequence = nonnegative_integer(&row, 3, "outbox sequence")?;
+            let record_index = nonnegative_integer(&row, 4, "outbox record index")?;
+            let payload = text_value(&row, 5, "outbox payload")?;
             records.push(OutboxRecord::new(
+                stream_binding,
+                stream_name,
                 OutboxKey::new(source_do_id, event_sequence, record_index as u32),
                 serde_json::from_str(&payload)?,
             ));
         }
         Ok(records)
+    }
+
+    /// Reports whether a relay lease remains active after expired claims are reclaimed.
+    async fn has_unexpired_inflight(&self, now: u64) -> Result<bool> {
+        let _guard = self.event_lock.clone().lock_owned().await;
+        let connection = self.connection.lock().await;
+        let mut rows = connection
+            .query(
+                "SELECT 1 FROM __verglas_outbox
+                 WHERE state = 'inflight' AND lease_expires_at > ?1 LIMIT 1",
+                [now as i64],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
     }
 
     /// Marks one pending outbox row inflight with an expiring relay lease.
@@ -487,6 +536,8 @@ pub struct TursoEvent {
     connection: Arc<Mutex<Connection>>,
     /// Exclusive event gate held until commit or rollback completes.
     event_guard: OwnedMutexGuard<()>,
+    /// Next record index allocated by this event's Stream sends.
+    next_record_index: AtomicU32,
     /// Tracks whether an explicit terminal operation completed.
     finished: bool,
 }
@@ -663,31 +714,63 @@ impl TursoEvent {
         Ok(sockets)
     }
 
-    /// Adds one deterministic JSON publication to this event transaction.
-    pub async fn append_outbox(&self, record_index: u32, payload: JsonValue) -> Result<OutboxKey> {
+    /// Adds a JSON array of logical Stream records to this event transaction.
+    ///
+    /// Record indexes are allocated once per event, so multiple `send` calls
+    /// cannot collide and every retry reuses the committed triple identity.
+    pub async fn append_stream_records(
+        &self,
+        stream_binding: &str,
+        stream_name: &str,
+        payloads: Vec<JsonValue>,
+    ) -> Result<Vec<OutboxKey>> {
         self.ensure_active()?;
-        let key = OutboxKey::new(
-            self.source_do_id.to_string(),
-            self.event_sequence,
-            record_index,
-        );
-        let payload = serde_json::to_string(&payload)?;
+        if stream_binding.trim().is_empty() || stream_name.trim().is_empty() {
+            return Err(Error::InvalidSchema(
+                "Stream binding and name must be nonempty".to_owned(),
+            ));
+        }
+        let count = u32::try_from(payloads.len()).map_err(|_| {
+            Error::InvalidSchema("Stream send contains too many records".to_owned())
+        })?;
+        let start = self
+            .next_record_index
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(count)
+            })
+            .map_err(|_| Error::InvalidSchema("event Stream record index overflow".to_owned()))?;
         let connection = self.connection.lock().await;
-        connection
-            .execute(
-                "INSERT INTO __verglas_outbox
-                 (source_do_id, event_sequence, record_index, event_id, payload, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
-                (
-                    key.source_do_id.as_str(),
-                    key.event_sequence as i64,
-                    key.record_index as i64,
-                    key.event_id(),
-                    payload,
-                ),
-            )
-            .await?;
-        Ok(key)
+        let mut keys = Vec::with_capacity(payloads.len());
+        for (offset, payload) in payloads.into_iter().enumerate() {
+            let record_index = start
+                + u32::try_from(offset)
+                    .map_err(|_| Error::InvalidSchema("Stream record index overflow".to_owned()))?;
+            let key = OutboxKey::new(
+                self.source_do_id.to_string(),
+                self.event_sequence,
+                record_index,
+            );
+            let payload = serde_json::to_string(&payload)?;
+            connection
+                .execute(
+                    "INSERT INTO __verglas_outbox
+                     (stream_binding, stream_name, source_do_id, event_sequence, record_index,
+                      event_id, payload, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+                    (
+                        stream_binding,
+                        stream_name,
+                        key.source_do_id.as_str(),
+                        key.event_sequence as i64,
+                        key.record_index as i64,
+                        key.event_id(),
+                        payload,
+                    ),
+                )
+                .await?;
+            keys.push(key);
+        }
+        Ok(keys)
     }
 
     /// Commits the local event transaction and pushes it to remote Turso.

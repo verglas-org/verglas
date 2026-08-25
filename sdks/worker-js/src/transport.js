@@ -13,6 +13,7 @@ import {
   put as witPut,
   setAlarm as witSetAlarm,
   sqlRows as witSqlRows,
+  streamSend as witStreamSend,
 } from 'verglas:do-worker/storage@0.1.0';
 import {
   attached as witAttached,
@@ -32,6 +33,7 @@ export function createWitTransport() {
     delete: witDelete,
     list: witList,
     sqlRows: witSqlRows,
+    streamSend: witStreamSend,
     setAlarm: witSetAlarm,
     getAlarm: witGetAlarm,
     deleteAlarm: witDeleteAlarm,

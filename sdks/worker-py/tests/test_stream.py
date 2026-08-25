@@ -17,7 +17,7 @@ from workers import (  # noqa: E402
     Response,
     WorkerError,
 )
-from workers._runtime import Environment  # noqa: E402
+from workers._runtime import Environment, Storage  # noqa: E402
 
 
 STREAM_MAX_REQUEST_BYTES = 5 * 1024 * 1024
@@ -65,6 +65,39 @@ class StreamBindingTests(unittest.TestCase):
             ).encode("utf-8"),
         )
         self.assertIsNone(request.ws)
+
+    def test_durable_object_send_stages_records_through_storage(self) -> None:
+        """A Durable Object Stream binding records logical rows in its event."""
+        calls: list[tuple[str, str, str]] = []
+
+        class StagedHost:
+            def stream_send(self, binding: str, stream: str, records: str) -> None:
+                calls.append((binding, stream, records))
+
+        stream = PipelineBinding("STREAM", "stream-id", StagedHost(), transactional=True)
+        asyncio.run(stream.send([{"event": "staged"}]))
+        self.assertEqual(calls, [("STREAM", "stream-id", '[{"event":"staged"}]')])
+
+    def test_durable_object_environment_uses_transactional_stream_transport(self) -> None:
+        """A Durable Object environment routes its manifest Stream through storage."""
+        calls: list[tuple[str, str, str]] = []
+
+        class StorageHost:
+            def stream_send(self, binding: str, stream: str, records: str) -> None:
+                calls.append((binding, stream, records))
+
+        storage_host = StorageHost()
+        environment = Environment(
+            Storage(storage_host),
+            None,
+            StreamHost(),
+            {},
+            [],
+            [{"binding": "STREAM", "stream": "stream-id"}],
+            transactional_streams=True,
+        )
+        asyncio.run(environment.STREAM.send([{"event": "handler"}]))
+        self.assertEqual(calls, [("STREAM", "stream-id", '[{"event":"handler"}]')])
 
     def test_send_rejects_non_arrays_and_non_json_values_before_host_call(self) -> None:
         """Input validation rejects values JSON.stringify would not accept."""

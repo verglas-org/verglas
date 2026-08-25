@@ -100,11 +100,16 @@ pub trait WorkerStorage: Send + Sync {
     /// Lists keys with a prefix subject to the caller's result bound.
     async fn list(&self, prefix: String, limit: u32) -> Result<Vec<String>, HostError>;
 
-    /// Executes one SQL statement and returns its Arrow IPC result bytes.
-    async fn sql(&self, statement: String) -> Result<Vec<u8>, HostError>;
-
     /// Executes one SQL statement and returns its rows as one JSON array.
     async fn sql_rows(&self, statement: String) -> Result<String, HostError>;
+
+    /// Stages a JSON record array for one configured Stream in this event.
+    async fn stream_send(
+        &self,
+        stream_binding: String,
+        stream_name: String,
+        records: String,
+    ) -> Result<(), HostError>;
 
     /// Stages the event's single durable alarm deadline.
     async fn set_alarm(&self, epoch_millis: u64) -> Result<(), HostError>;
@@ -247,15 +252,23 @@ impl bindings::verglas::do_worker::storage::Host for WorkerHost {
             .map_err(to_handler_error)
     }
 
-    /// Delegates a WIT SQL statement to the configured storage capability.
-    async fn sql(&mut self, statement: String) -> Result<Vec<u8>, WitHandlerError> {
-        self.storage.sql(statement).await.map_err(to_handler_error)
-    }
-
     /// Delegates the WIT JSON-row SQL statement to the storage capability.
     async fn sql_rows(&mut self, statement: String) -> Result<String, WitHandlerError> {
         self.storage
             .sql_rows(statement)
+            .await
+            .map_err(to_handler_error)
+    }
+
+    /// Delegates a transactional Stream send to the storage capability.
+    async fn stream_send(
+        &mut self,
+        stream_binding: String,
+        stream_name: String,
+        records: String,
+    ) -> Result<(), WitHandlerError> {
+        self.storage
+            .stream_send(stream_binding, stream_name, records)
             .await
             .map_err(to_handler_error)
     }

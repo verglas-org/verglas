@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
-use verglas_do_turso::{OutboxRecord, StreamAppender};
-use verglas_do_wasm::{HostError, WorkerStorage};
-use verglas_runtime::TursoWorkerStorage;
+use verglas_do_turso::{OutboxKey, OutboxRecord, StreamAppender};
+use verglas_do_wasm::{HostError, Request, Response, WorkerBindings, WorkerStorage};
+use verglas_runtime::{BindingStreamAppender, TursoWorkerStorage};
 
 /// Test-only Stream appender that records the ACKed batch without changing storage.
 #[derive(Clone, Default)]
@@ -28,6 +28,32 @@ impl StreamAppender for RecordingAppender {
     async fn append(&self, records: Vec<OutboxRecord>) -> verglas_do_turso::Result<()> {
         self.records.lock().await.extend(records);
         Ok(())
+    }
+}
+
+/// Binding double that records the internal Stream append request.
+#[derive(Default)]
+struct RecordingBindings {
+    /// Requests sent through the injected binding channel.
+    requests: Mutex<Vec<Request>>,
+}
+
+#[async_trait]
+impl WorkerBindings for RecordingBindings {
+    /// Records the request and returns a durable-looking 202 response.
+    async fn do_fetch(
+        &self,
+        _binding: String,
+        _object: String,
+        request: Request,
+    ) -> Result<Response, HostError> {
+        self.requests.lock().await.push(request);
+        Ok(Response {
+            status: 202,
+            headers: Vec::new(),
+            body: Vec::new(),
+            accept_ws: None,
+        })
     }
 }
 
@@ -73,19 +99,45 @@ async fn event_storage_reads_own_worker_state_writes() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// A Stream send is only a staged Turso mutation until the event commits.
+#[tokio::test]
+async fn stream_send_is_staged_until_event_commit() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (store, storage) = event_storage(&root).await?;
+    storage
+        .stream_send(
+            "STREAM".to_owned(),
+            "stream-id".to_owned(),
+            r#"[{"value":1},{"value":2}]"#.to_owned(),
+        )
+        .await?;
+    storage.rollback().await?;
+    assert!(store.pending_outbox(10).await?.is_empty());
+
+    let committed = TursoWorkerStorage::begin(Arc::clone(&store)).await?;
+    committed
+        .stream_send(
+            "STREAM".to_owned(),
+            "stream-id".to_owned(),
+            r#"[{"value":3}]"#.to_owned(),
+        )
+        .await?;
+    committed
+        .commit()
+        .await
+        .expect_err("no appender must hold effects");
+    let pending = store.pending_outbox(10).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event_id(), "runtime-worker:1:0");
+    Ok(())
+}
+
 /// SQL DDL and DML execute inside the same Turso event as Worker state.
 #[tokio::test]
 async fn event_storage_sql_ddl_dml_and_json_rows() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let (_store, storage) = event_storage(&root).await?;
 
-    let arrow_error = storage
-        .sql("CREATE TABLE items (id INTEGER, name TEXT)".to_owned())
-        .await
-        .expect_err("Arrow IPC SQL must be a typed hard error");
-    assert!(
-        matches!(arrow_error, HostError::Unsupported { operation } if operation.contains("Arrow IPC"))
-    );
     assert_eq!(
         storage
             .sql_rows("CREATE TABLE items (id INTEGER, name TEXT)".to_owned())
@@ -187,6 +239,34 @@ async fn commit_and_reopen_preserves_event_state() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// The runtime appender emits the Stream route and producer identities to internal append.
+#[tokio::test]
+async fn binding_appender_waits_for_internal_stream_ack() -> Result<(), Box<dyn std::error::Error>>
+{
+    let bindings = Arc::new(RecordingBindings::default());
+    let appender = BindingStreamAppender::new(bindings.clone());
+    appender
+        .append(vec![OutboxRecord::new(
+            "STREAM",
+            "stream-id",
+            OutboxKey::new("runtime-worker", 7, 3),
+            serde_json::json!({ "value": 1 }),
+        )])
+        .await?;
+    let requests = bindings.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].uri, "https://verglas.internal/stream/append");
+    assert_eq!(
+        requests[0].headers[1],
+        (
+            "x-verglas-producer-event-id".to_owned(),
+            "[\"runtime-worker:7:3\"]".to_owned()
+        )
+    );
+    Ok(())
+}
+
 /// A successful commit drains the injected outbox only after local state commits.
 #[tokio::test]
 async fn commit_drains_enabled_outbox_after_state_commit() -> Result<(), Box<dyn std::error::Error>>
@@ -198,13 +278,17 @@ async fn commit_drains_enabled_outbox_after_state_commit() -> Result<(), Box<dyn
     storage
         .put("selected".to_owned(), b"state".to_vec())
         .await?;
-    let key = storage
-        .append_outbox(0, serde_json::json!({ "value": 1 }))
+    storage
+        .stream_send(
+            "STREAM".to_owned(),
+            "stream-id".to_owned(),
+            r#"[{"value":1}]"#.to_owned(),
+        )
         .await?;
     storage.commit().await?;
     let records = appender.records.lock().await.clone();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].key, key);
+    assert_eq!(records[0].event_id(), "runtime-worker:1:0");
     assert!(store.pending_outbox(10).await?.is_empty());
     let event = store.begin_event().await?;
     assert_eq!(event.get_kv("selected").await?, Some(b"state".to_vec()));

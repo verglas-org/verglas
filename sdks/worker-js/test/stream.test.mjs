@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createStreamBinding, createWorker } from '../src/cloudflare-workers.js';
+import { createHandler, createStreamBinding, createWorker } from '../src/cloudflare-workers.js';
 
 const MAX_REQUEST_BYTES = 5 * 1024 * 1024;
 
@@ -32,6 +32,42 @@ test('Stream.send sends the named object a canonical JSON POST and awaits a 2xx 
     { event: 'one' },
     { event: 'two' },
   ]);
+});
+
+test('Durable Object Stream.send stages records through storage before event commit', async () => {
+  const calls = [];
+  const stream = createStreamBinding('STREAM', 'stream-id', {
+    streamSend(binding, object, records) {
+      calls.push({ binding, object, records });
+    },
+  }, { transactional: true });
+
+  await stream.send([{ event: 'staged' }]);
+  assert.deepEqual(calls, [{ binding: 'STREAM', object: 'stream-id', records: '[{"event":"staged"}]' }]);
+});
+
+test('Durable Object handlers receive transactional Stream bindings from the manifest', async () => {
+  const calls = [];
+  let stream;
+  class Counter {
+    constructor(_state, env) {
+      stream = env.STREAM;
+    }
+  }
+  const handler = createHandler({ Counter }, {
+    bindings: [{ name: 'COUNTER', class_name: 'Counter' }],
+    pipelines: [{ binding: 'STREAM', stream: 'stream-id' }],
+  }, {
+    objectId: { toString: () => '0'.repeat(64) },
+    transport: {
+      streamSend(binding, object, records) {
+        calls.push({ binding, object, records });
+      },
+    },
+  });
+  await handler.init();
+  await stream.send([{ event: 'handler' }]);
+  assert.deepEqual(calls, [{ binding: 'STREAM', object: 'stream-id', records: '[{"event":"handler"}]' }]);
 });
 
 test('Stream.send rejects non-arrays, non-JSON values, and payloads over 5 MiB', async () => {

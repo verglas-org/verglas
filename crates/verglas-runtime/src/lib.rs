@@ -7,4 +7,4 @@ pub mod event_endpoint;
 pub mod worker_storage;
 
 pub use event_endpoint::{EventDispatcher, EventEndpoint, EventEndpointError};
-pub use worker_storage::TursoWorkerStorage;
+pub use worker_storage::{BindingStreamAppender, TursoWorkerStorage};

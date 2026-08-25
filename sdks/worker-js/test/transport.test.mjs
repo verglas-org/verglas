@@ -11,6 +11,7 @@ test('transport adapter routes structured WIT verbs without envelopes', async ()
     delete: (key) => { calls.push(['delete', key]); return { tag: 'ok', val: true }; },
     list: (prefix, limit) => { calls.push(['list', prefix, limit]); return { tag: 'ok', val: ['a'] }; },
     sqlRows: (statement) => { calls.push(['sql-rows', statement]); return { tag: 'ok', val: '[]' }; },
+    streamSend: (binding, stream, records) => { calls.push(['stream-send', binding, stream, records]); return { tag: 'ok', val: undefined }; },
     setAlarm: (value) => { calls.push(['set-alarm', value]); return { tag: 'ok', val: undefined }; },
     getAlarm: () => { calls.push(['get-alarm']); return { tag: 'ok', val: { tag: 'some', val: 10n } }; },
     deleteAlarm: () => { calls.push(['delete-alarm']); return { tag: 'ok', val: undefined }; },
@@ -28,6 +29,7 @@ test('transport adapter routes structured WIT verbs without envelopes', async ()
   assert.equal(transport.delete('value'), true);
   assert.deepEqual(transport.list('prefix', 3), ['a']);
   assert.equal(transport.sqlRows('SELECT 1'), '[]');
+  transport.streamSend('STREAM', 'stream-id', '[{"value":1}]');
   transport.setAlarm(10);
   assert.equal(transport.getAlarm(), 10n);
   transport.deleteAlarm();
@@ -36,7 +38,7 @@ test('transport adapter routes structured WIT verbs without envelopes', async ()
   assert.equal(result.object, 'alice');
   assert.deepEqual(transport.attached(), [2n]);
   assert.deepEqual(calls.map(([operation]) => operation), [
-    'get', 'put', 'delete', 'list', 'sql-rows', 'set-alarm', 'get-alarm',
+    'get', 'put', 'delete', 'list', 'sql-rows', 'stream-send', 'set-alarm', 'get-alarm',
     'delete-alarm', 'send',
   ]);
   assert.equal(calls.some(([operation]) => /commit|query|begin|statement/i.test(operation)), false);
@@ -49,6 +51,7 @@ test('transport adapter raises host errors at the named WIT operation', () => {
     delete: () => undefined,
     list: () => undefined,
     sqlRows: () => undefined,
+    streamSend: () => undefined,
     setAlarm: () => undefined,
     getAlarm: () => undefined,
     deleteAlarm: () => undefined,

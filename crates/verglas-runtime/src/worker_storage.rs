@@ -5,13 +5,79 @@
 //! adapter only owns transaction lifetime, WIT error conversion, and the
 //! commit/push/outbox publication boundary.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use verglas_do_turso::{OutboxKey, TursoEvent, TursoStore};
-use verglas_do_wasm::{HostError, WorkerStorage};
+use verglas_do_turso::{OutboxRecord, StreamAppender, TursoEvent, TursoStore};
+use verglas_do_wasm::{HostError, Request, WorkerBindings, WorkerStorage};
+
+/// Real runtime Stream appender that routes internal append requests through the
+/// injected Durable Object binding channel and waits for a 2xx response.
+pub struct BindingStreamAppender {
+    /// Gateway binding router used for the internal Stream request.
+    bindings: Arc<dyn WorkerBindings>,
+}
+
+impl BindingStreamAppender {
+    /// Creates an appender backed by one live binding router.
+    pub fn new(bindings: Arc<dyn WorkerBindings>) -> Self {
+        Self { bindings }
+    }
+}
+
+#[async_trait]
+impl StreamAppender for BindingStreamAppender {
+    /// Sends grouped records with producer identities and waits for durable ACK.
+    async fn append(&self, records: Vec<OutboxRecord>) -> verglas_do_turso::Result<()> {
+        let mut grouped = BTreeMap::<(String, String), Vec<&OutboxRecord>>::new();
+        for record in &records {
+            grouped
+                .entry((record.stream_binding.clone(), record.stream_name.clone()))
+                .or_default()
+                .push(record);
+        }
+        for ((binding, stream), records) in grouped {
+            let payloads = records
+                .iter()
+                .map(|record| record.payload.clone())
+                .collect::<Vec<_>>();
+            let identities = records
+                .iter()
+                .map(|record| record.event_id())
+                .collect::<Vec<_>>();
+            let body = serde_json::to_vec(&payloads)?;
+            let identity = serde_json::to_string(&identities)?;
+            let response = self
+                .bindings
+                .do_fetch(
+                    binding,
+                    stream,
+                    Request {
+                        method: "POST".to_owned(),
+                        uri: "https://verglas.internal/stream/append".to_owned(),
+                        headers: vec![
+                            ("content-type".to_owned(), "application/json".to_owned()),
+                            ("x-verglas-producer-event-id".to_owned(), identity),
+                        ],
+                        body,
+                        ws: None,
+                    },
+                )
+                .await
+                .map_err(|error| verglas_do_turso::Error::StreamAppend(error.to_string()))?;
+            if !(200..300).contains(&response.status) {
+                return Err(verglas_do_turso::Error::StreamAppend(format!(
+                    "HTTP {}",
+                    response.status
+                )));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Turso-backed transactional storage capability for one Worker event.
 ///
@@ -50,19 +116,24 @@ impl TursoWorkerStorage {
         event.rollback().await.map_err(turso_error)
     }
 
-    /// Appends one selected JSON record to this event's transactional outbox.
-    pub async fn append_outbox(
+    /// Stages a JSON Stream record array inside the current Turso event.
+    pub async fn stream_send(
         &self,
-        record_index: u32,
-        payload: Value,
-    ) -> Result<OutboxKey, HostError> {
+        stream_binding: String,
+        stream_name: String,
+        records: String,
+    ) -> Result<(), HostError> {
+        let payloads: Vec<Value> = serde_json::from_str(&records).map_err(|error| {
+            HostError::backend(format!("Stream records must be a JSON array: {error}"))
+        })?;
         let event = self.event_ref().await?;
         let event = event
             .as_ref()
             .ok_or_else(|| HostError::backend("event transaction has already been finished"))?;
         event
-            .append_outbox(record_index, payload)
+            .append_stream_records(&stream_binding, &stream_name, payloads)
             .await
+            .map(|_| ())
             .map_err(turso_error)
     }
 
@@ -105,7 +176,7 @@ impl TursoWorkerStorage {
             .ok_or_else(|| HostError::backend("event transaction has already been finished"))
     }
 
-    /// Borrows the active event while one capability operation is in flight.
+    /// Borrows the active event while one immutable capability operation is in flight.
     async fn event_ref(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, Option<TursoEvent>>, HostError> {
@@ -162,11 +233,14 @@ impl WorkerStorage for TursoWorkerStorage {
         event.list_kv(&prefix, limit).await.map_err(turso_error)
     }
 
-    /// Rejects the removed Arrow IPC SQL capability honestly.
-    async fn sql(&self, _statement: String) -> Result<Vec<u8>, HostError> {
-        Err(HostError::Unsupported {
-            operation: "Arrow IPC SQL was removed; use sql_rows",
-        })
+    /// Stages one logical Stream send in the active Turso transaction.
+    async fn stream_send(
+        &self,
+        stream_binding: String,
+        stream_name: String,
+        records: String,
+    ) -> Result<(), HostError> {
+        self.stream_send(stream_binding, stream_name, records).await
     }
 
     /// Executes SQL and returns Turso rows as one JSON array.

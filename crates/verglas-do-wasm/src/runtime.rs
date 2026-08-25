@@ -441,14 +441,19 @@ mod tests {
             Ok(Vec::new())
         }
 
-        /// Returns no rows because the linker test does not invoke storage.
-        async fn sql(&self, _statement: String) -> Result<Vec<u8>, crate::abi::HostError> {
-            Ok(Vec::new())
-        }
-
         /// Returns no JSON rows because the linker test does not invoke storage.
         async fn sql_rows(&self, _statement: String) -> Result<String, crate::abi::HostError> {
             Ok("[]".to_owned())
+        }
+
+        /// Accepts no Stream send because the linker test does not invoke storage.
+        async fn stream_send(
+            &self,
+            _stream_binding: String,
+            _stream_name: String,
+            _records: String,
+        ) -> Result<(), crate::abi::HostError> {
+            Ok(())
         }
 
         /// Accepts no alarm because the linker test does not invoke storage.

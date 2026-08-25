@@ -43,6 +43,10 @@ impl OutboxKey {
 /// One JSON record held in the transactional outbox.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutboxRecord {
+    /// Manifest binding name used to route to the Stream object.
+    pub stream_binding: String,
+    /// Durable Stream object identity receiving this record.
+    pub stream_name: String,
     /// Deterministic record identity.
     pub key: OutboxKey,
     /// JSON payload handed to the Stream binding.
@@ -50,9 +54,19 @@ pub struct OutboxRecord {
 }
 
 impl OutboxRecord {
-    /// Creates an outbox record without assigning a second storage identity.
-    pub fn new(key: OutboxKey, payload: Value) -> Self {
-        Self { key, payload }
+    /// Creates an outbox record with its immutable Stream route.
+    pub fn new(
+        stream_binding: impl Into<String>,
+        stream_name: impl Into<String>,
+        key: OutboxKey,
+        payload: Value,
+    ) -> Self {
+        Self {
+            stream_binding: stream_binding.into(),
+            stream_name: stream_name.into(),
+            key,
+            payload,
+        }
     }
 
     /// Returns the deterministic identity sent to Stream for deduplication.

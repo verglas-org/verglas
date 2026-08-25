@@ -39,6 +39,8 @@ pub fn reserved_schema() -> BTreeMap<&'static str, Vec<(&'static str, &'static s
         (
             OUTBOX_TABLE,
             vec![
+                ("stream_binding", "TEXT"),
+                ("stream_name", "TEXT"),
                 ("source_do_id", "TEXT"),
                 ("event_sequence", "INTEGER"),
                 ("record_index", "INTEGER"),
@@ -88,6 +90,8 @@ pub async fn create_reserved_tables(connection: &Connection) -> Result<()> {
     connection
         .execute(
             "CREATE TABLE IF NOT EXISTS __verglas_outbox (
+                stream_binding TEXT NOT NULL,
+                stream_name TEXT NOT NULL,
                 source_do_id TEXT NOT NULL,
                 event_sequence INTEGER NOT NULL,
                 record_index INTEGER NOT NULL,

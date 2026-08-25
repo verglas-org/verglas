@@ -35,14 +35,19 @@ impl WorkerStorage for TestStorage {
         Ok(Vec::new())
     }
 
-    /// Returns an empty SQL result.
-    async fn sql(&self, _statement: String) -> Result<Vec<u8>, HostError> {
-        Ok(Vec::new())
-    }
-
     /// Returns an empty JSON row array.
     async fn sql_rows(&self, _statement: String) -> Result<String, HostError> {
         Ok("[]".to_owned())
+    }
+
+    /// Accepts a Stream send without invoking a handler in this test.
+    async fn stream_send(
+        &self,
+        _stream_binding: String,
+        _stream_name: String,
+        _records: String,
+    ) -> Result<(), HostError> {
+        Ok(())
     }
 
     /// Accepts an alarm deadline.

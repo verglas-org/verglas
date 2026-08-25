@@ -18,26 +18,33 @@ const textEncoder = new TextEncoder();
  * A fixed Cloudflare Pipeline binding whose send call targets one Stream object.
  */
 export class PipelineBinding {
-  /** @param {string} bindingName @param {string} streamName @param {{doFetch: Function}} transport */
-  constructor(bindingName, streamName, transport) {
+  /** @param {string} bindingName @param {string} streamName @param {object} transport @param {{transactional?: boolean}} [options] */
+  constructor(bindingName, streamName, transport, options = {}) {
     if (typeof bindingName !== 'string' || bindingName.trim() === '') {
       throw new TypeError('Pipeline binding name must be a non-empty string');
     }
     if (typeof streamName !== 'string' || streamName.trim() === '') {
       throw new TypeError('Stream identity must be a non-empty string');
     }
-    if (!transport || typeof transport.doFetch !== 'function') {
-      throw new TypeError('Stream binding requires the WIT bindings.do-fetch transport');
+    const transactional = options.transactional === true;
+    if (transactional) {
+      if (!transport || typeof transport.streamSend !== 'function') {
+        throw new TypeError('Durable Object Stream binding requires the WIT storage.stream-send transport');
+      }
+    } else if (!transport || typeof transport.doFetch !== 'function') {
+      throw new TypeError('Worker Stream binding requires the WIT bindings.do-fetch transport');
     }
     this.#bindingName = bindingName;
     this.#streamName = streamName;
     this.#transport = transport;
+    this.#transactional = transactional;
     Object.freeze(this);
   }
 
   #bindingName;
   #streamName;
   #transport;
+  #transactional;
 
   /**
    * Sends JSON records and resolves only after the Stream returns a 2xx ACK.
@@ -50,14 +57,20 @@ export class PipelineBinding {
     }
     assertJsonValue(records, new WeakSet());
 
+    let serialized;
     let encoded;
     try {
-      encoded = textEncoder.encode(JSON.stringify(records));
+      serialized = JSON.stringify(records);
+      encoded = textEncoder.encode(serialized);
     } catch (error) {
       throw new TypeError(`Stream.send requires JSON-serializable records: ${error.message}`);
     }
     if (encoded.byteLength > STREAM_MAX_REQUEST_BYTES) {
       throw new RangeError(`Stream.send request exceeds the 5 MiB encoded request limit (${encoded.byteLength} bytes)`);
+    }
+    if (this.#transactional) {
+      await this.#transport.streamSend(this.#bindingName, this.#streamName, serialized);
+      return;
     }
 
     const rawResult = await this.#transport.doFetch(
@@ -83,11 +96,12 @@ export class PipelineBinding {
  * Creates one fixed Pipeline binding for the generated Worker environment.
  * @param {string} bindingName
  * @param {string} streamName
- * @param {{doFetch: Function}} transport
+ * @param {object} transport
+ * @param {{transactional?: boolean}} [options]
  * @returns {PipelineBinding}
  */
-export function createStreamBinding(bindingName, streamName, transport) {
-  return new PipelineBinding(bindingName, streamName, transport);
+export function createStreamBinding(bindingName, streamName, transport, options) {
+  return new PipelineBinding(bindingName, streamName, transport, options);
 }
 
 /**

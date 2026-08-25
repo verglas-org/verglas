@@ -46,6 +46,9 @@ class _StorageImports(Protocol):
     def sql_rows(self, statement: str) -> str:
         """Execute SQL and return its JSON row array."""
 
+    def stream_send(self, stream_binding: str, stream_name: str, records: str) -> None:
+        """Stage a JSON record array for one configured Stream."""
+
     def set_alarm(self, epoch_millis: int) -> None:
         """Stage the Durable Object alarm deadline."""
 
@@ -80,6 +83,9 @@ class _BindingImports(Protocol):
 
     def do_fetch(self, binding: str, object: str, request: Any) -> Any:
         """Forward one request to the named Durable Object instance."""
+
+    def stream_send(self, binding: str, stream: str, records: str) -> Any:
+        """Stage one Stream record array in the current Durable Object event."""
 
 
 _wit_types: Any = None
@@ -855,17 +861,28 @@ def _assert_json_value(value: Any, ancestors: set[int]) -> None:
 class PipelineBinding:
     """A fixed Pipeline Stream binding exposing only asynchronous ``send``."""
 
-    def __init__(self, binding_name: str, stream_name: str, imports: _BindingImports):
+    def __init__(
+        self,
+        binding_name: str,
+        stream_name: str,
+        imports: _BindingImports,
+        *,
+        transactional: bool = False,
+    ):
         """Bind one Wrangler name to one immutable Stream identity."""
         if not isinstance(binding_name, str) or not binding_name.strip():
             raise TypeError("Pipeline binding name must be a non-empty string")
         if not isinstance(stream_name, str) or not stream_name.strip():
             raise TypeError("Stream identity must be a non-empty string")
-        if not hasattr(imports, "do_fetch") or not callable(imports.do_fetch):
-            raise TypeError("Stream binding requires the WIT bindings.do-fetch transport")
+        if transactional:
+            if not hasattr(imports, "stream_send") or not callable(imports.stream_send):
+                raise TypeError("Durable Object Stream binding requires the WIT storage.stream-send transport")
+        elif not hasattr(imports, "do_fetch") or not callable(imports.do_fetch):
+            raise TypeError("Worker Stream binding requires the WIT bindings.do-fetch transport")
         self._binding_name = binding_name
         self._stream_name = stream_name
         self._imports = imports
+        self._transactional = transactional
 
     async def send(self, records: list[Any]) -> None:
         """Append a JSON record array and wait for a durable 2xx acknowledgement."""
@@ -888,6 +905,14 @@ class PipelineBinding:
                 "Pipeline.send request exceeds the 5 MiB encoded request limit "
                 f"({len(encoded)} bytes)"
             )
+        if self._transactional:
+            _call_host(
+                self._imports.stream_send,
+                self._binding_name,
+                self._stream_name,
+                encoded.decode("utf-8"),
+            )
+            return
 
         if _wit_types is None:
             host_request: Any = SimpleNamespace(
@@ -1020,6 +1045,8 @@ class Environment:
         variables: Mapping[str, Any],
         binding_records: list[Mapping[str, str]],
         pipeline_records: list[Mapping[str, str]] | None = None,
+        *,
+        transactional_streams: bool = False,
     ):
         """Create one environment view for a Worker or Durable Object."""
         self._storage = storage
@@ -1036,7 +1063,8 @@ class Environment:
             self._pipelines[binding] = PipelineBinding(
                 binding,
                 str(record["stream"]),
-                binding_imports,
+                self._storage._imports if transactional_streams and self._storage is not None else binding_imports,
+                transactional=transactional_streams,
             )
         self._sockets = sockets
 

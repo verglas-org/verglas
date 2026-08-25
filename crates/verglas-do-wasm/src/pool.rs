@@ -168,13 +168,18 @@ impl bindings::verglas::do_worker::storage::Host for PoolHost {
         Err(stateless_storage_error())
     }
 
-    /// Rejects SQL because pool workers are stateless.
-    async fn sql(&mut self, _statement: String) -> Result<Vec<u8>, WitHandlerError> {
+    /// Rejects row SQL because pool workers are stateless.
+    async fn sql_rows(&mut self, _statement: String) -> Result<String, WitHandlerError> {
         Err(stateless_storage_error())
     }
 
-    /// Rejects row SQL because pool workers are stateless.
-    async fn sql_rows(&mut self, _statement: String) -> Result<String, WitHandlerError> {
+    /// Rejects Stream publication because pool workers have no event transaction.
+    async fn stream_send(
+        &mut self,
+        _stream_binding: String,
+        _stream_name: String,
+        _records: String,
+    ) -> Result<(), WitHandlerError> {
         Err(stateless_storage_error())
     }
 

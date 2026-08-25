@@ -6,9 +6,32 @@
 
 #![cfg(feature = "test-support")]
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use verglas_do_turso::{OutboxKey, OutboxRecord, TursoStore};
+use tokio::sync::Mutex;
+use verglas_do_turso::{OutboxKey, OutboxRecord, StreamAppender, TursoStore};
+
+/// Test appender that records every ACKed batch and can fail before acknowledgement.
+#[derive(Clone, Default)]
+struct RecordingAppender {
+    batches: Arc<Mutex<Vec<Vec<OutboxRecord>>>>,
+    fail: bool,
+}
+
+#[async_trait]
+impl StreamAppender for RecordingAppender {
+    /// Records a batch as durable only when failure mode is disabled.
+    async fn append(&self, records: Vec<OutboxRecord>) -> verglas_do_turso::Result<()> {
+        if self.fail {
+            return Err(verglas_do_turso::Error::OutboxUnavailable);
+        }
+        self.batches.lock().await.push(records);
+        Ok(())
+    }
+}
 
 /// Returns a fresh test store rooted in a complete temporary sidecar family.
 async fn store(root: &TempDir) -> Result<TursoStore, verglas_do_turso::Error> {
@@ -102,7 +125,50 @@ async fn handler_error_rolls_back_everything() -> Result<(), verglas_do_turso::E
     Ok(())
 }
 
-/// The outbox identity is deterministic and written in the same transaction as state.
+/// Stream sends stage records with one event sequence and contiguous indexes.
+#[tokio::test]
+async fn stream_send_stages_records_inside_the_source_transaction()
+-> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let store = store(&root).await?;
+    let event = store.begin_event().await?;
+    event.put_kv("selected", b"state".to_vec()).await?;
+    let keys = event
+        .append_stream_records(
+            "STREAM",
+            "stream-id",
+            vec![json!({ "kind": "one" }), json!({ "kind": "two" })],
+        )
+        .await?;
+    assert_eq!(keys[0].event_id(), "worker-test:1:0");
+    assert_eq!(keys[1].event_id(), "worker-test:1:1");
+    event.rollback().await?;
+    assert!(store.pending_outbox(10).await?.is_empty());
+    Ok(())
+}
+
+/// A source commit before Stream send is replayed from the durable outbox on activation.
+#[tokio::test]
+async fn source_commit_before_stream_send_replays_on_activation()
+-> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let store = store(&root).await?;
+    let event = store.begin_event().await?;
+    event
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
+        .await?;
+    event.commit_and_push().await?;
+    assert_eq!(store.pending_outbox(10).await?.len(), 1);
+
+    let appender = RecordingAppender::default();
+    store.set_stream_appender(Arc::new(appender.clone())).await;
+    store.drain_outbox().await?;
+    assert_eq!(appender.batches.lock().await.len(), 1);
+    assert!(store.pending_outbox(10).await?.is_empty());
+    Ok(())
+}
+
+/// A committed outbox row survives before-send and replays after an expired claim.
 #[tokio::test]
 async fn outbox_crash_windows_are_replayable() -> Result<(), verglas_do_turso::Error> {
     let root = tempfile::tempdir()?;
@@ -110,8 +176,9 @@ async fn outbox_crash_windows_are_replayable() -> Result<(), verglas_do_turso::E
     let event = store.begin_event().await?;
     event.put_kv("selected", b"state".to_vec()).await?;
     let key = event
-        .append_outbox(0, json!({ "kind": "selected", "value": 1 }))
-        .await?;
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "kind": "selected" })])
+        .await?[0]
+        .clone();
     event.commit_and_push().await?;
 
     let pending = store.pending_outbox(10).await?;
@@ -127,6 +194,55 @@ async fn outbox_crash_windows_are_replayable() -> Result<(), verglas_do_turso::E
     store.mark_outbox_inflight(&key, "relay-a", 20).await?;
     store.mark_outbox_delivered(&key, "relay-a").await?;
     assert!(store.pending_outbox(10).await?.is_empty());
+    Ok(())
+}
+
+/// A Stream ACK followed by a source crash resends the same identity for Stream deduplication.
+#[tokio::test]
+async fn ack_before_delivered_mark_replays_the_same_identity() -> Result<(), verglas_do_turso::Error>
+{
+    let root = tempfile::tempdir()?;
+    let store = store(&root).await?;
+    let appender = RecordingAppender::default();
+    store.set_stream_appender(Arc::new(appender.clone())).await;
+    let event = store.begin_event().await?;
+    event
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
+        .await?;
+    event.commit_and_push().await?;
+    let pending = store.pending_outbox(10).await?;
+    let key = pending[0].key.clone();
+    store.mark_outbox_inflight(&key, "crashed-relay", 0).await?;
+    appender.append(pending).await?;
+    store.reclaim_expired_outbox(0).await?;
+    store.drain_outbox().await?;
+    let batches = appender.batches.lock().await;
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0][0].event_id(), batches[1][0].event_id());
+    Ok(())
+}
+
+/// An appender failure keeps the relay lease and blocks the next serialized event.
+#[tokio::test]
+async fn appender_failure_holds_effects_and_next_event() -> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let store = store(&root).await?;
+    store
+        .set_stream_appender(Arc::new(RecordingAppender {
+            batches: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        }))
+        .await;
+    let event = store.begin_event().await?;
+    event
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
+        .await?;
+    event.commit_and_push().await?;
+    assert!(store.drain_outbox().await.is_err());
+    assert!(matches!(
+        store.begin_event().await,
+        Err(verglas_do_turso::Error::OutboxInFlight)
+    ));
     Ok(())
 }
 
@@ -154,6 +270,7 @@ async fn sql_cannot_touch_reserved_or_internal_tables() -> Result<(), verglas_do
 fn outbox_key_is_ordered_and_stable() {
     let key = OutboxKey::new("source", 7, 3);
     assert_eq!(key.event_id(), "source:7:3");
-    let record = OutboxRecord::new(key.clone(), json!({ "x": 1 }));
+    let record = OutboxRecord::new("STREAM", "stream-id", key.clone(), json!({ "x": 1 }));
     assert_eq!(record.key, key);
+    assert_eq!(record.stream_name, "stream-id");
 }

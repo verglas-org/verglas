@@ -27,7 +27,7 @@ use verglas_do_wasm::{
     WorkerRuntime, WorkerSockets, WorkerStorage,
 };
 
-use crate::worker_storage::TursoWorkerStorage;
+use crate::worker_storage::{BindingStreamAppender, TursoWorkerStorage};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -731,14 +731,27 @@ impl EventEndpoint {
         Ok(())
     }
 
-    /// Accepts one persistent gateway stream and services call results while events run.
+    /// Accepts one persistent gateway stream and clears its router on disconnect.
     async fn handle_connection(&mut self, stream: UnixStream) -> Result<(), EventEndpointError> {
+        let result = self.handle_connection_inner(stream).await;
+        self.store.clear_runtime_stream_appender().await;
+        result
+    }
+
+    /// Services one gateway stream while its connection-local router is live.
+    async fn handle_connection_inner(
+        &mut self,
+        stream: UnixStream,
+    ) -> Result<(), EventEndpointError> {
         let (read_half, mut write_half) = stream.into_split();
         self.write_effects(&mut write_half).await?;
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(32);
         let router = Arc::new(DoCallRouter::new(outbound_sender));
+        self.store
+            .set_runtime_stream_appender(Arc::new(BindingStreamAppender::new(router.clone())))
+            .await;
         let mut queued = VecDeque::new();
         loop {
             let frame = if let Some(frame) = queued.pop_front() {

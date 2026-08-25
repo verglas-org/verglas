@@ -26,7 +26,7 @@ export function unwrapOption(value) {
 /**
  * Creates one direct adapter from WIT verb functions. It does not serialize a
  * command line or construct a canonical transaction envelope.
- * @param {{get:Function,put:Function,delete:Function,list:Function,sqlRows:Function,setAlarm:Function,getAlarm:Function,deleteAlarm:Function,send:Function,close:Function,setAttachment:Function,getAttachment:Function,attached:Function,doFetch:Function}} imports
+ * @param {{get:Function,put:Function,delete:Function,list:Function,sqlRows:Function,streamSend:Function,setAlarm:Function,getAlarm:Function,deleteAlarm:Function,send:Function,close:Function,setAttachment:Function,getAttachment:Function,attached:Function,doFetch:Function}} imports
  * @returns {object}
  */
 export function createTransport(imports) {
@@ -46,6 +46,9 @@ export function createTransport(imports) {
     },
     sqlRows(statement) {
       return call('storage.sql-rows', imports.sqlRows, String(statement));
+    },
+    streamSend(binding, stream, records) {
+      return call('storage.stream-send', imports.streamSend, String(binding), String(stream), String(records));
     },
     setAlarm(milliseconds) {
       return call('storage.set-alarm', imports.setAlarm, BigInt(milliseconds));

@@ -32,6 +32,12 @@ pub enum Error {
     /// Reports an outbox lease owner mismatch.
     #[error("outbox lease owner does not match the current inflight row")]
     OutboxLeaseMismatch,
+    /// Reports an unexpired inflight outbox row that applies backpressure.
+    #[error("outbox publication is inflight and has not reached its lease expiry")]
+    OutboxInFlight,
+    /// Reports a failed internal Stream append acknowledgement.
+    #[error("internal Stream append failed: {0}")]
+    StreamAppend(String),
     /// Reports a value that cannot be represented honestly as JSON.
     #[error("SQL value cannot be represented as JSON: {0}")]
     JsonValue(String),

@@ -16,12 +16,41 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use verglas_do_turso::TursoStore;
+use verglas_do_turso::{OutboxRecord, StreamAppender, TursoStore};
 use verglas_do_wasm::{
     EventGate, EventPermit, HostError, PendingEvent, Request, Response, RuntimeError, SocketId,
     WorkerBindings, WorkerSockets, WorkerStorage,
 };
 use verglas_runtime::{EventDispatcher, EventEndpoint};
+
+/// Test appender that records successful delivery attempts without a Stream fallback.
+#[derive(Default)]
+struct CountingAppender {
+    /// Number of batches presented for durable acknowledgement.
+    calls: AtomicU64,
+}
+
+#[async_trait]
+impl StreamAppender for CountingAppender {
+    /// Records one append attempt and acknowledges it.
+    async fn append(&self, _records: Vec<OutboxRecord>) -> verglas_do_turso::Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Test appender that fails before the Stream acknowledgement boundary.
+struct FailingAppender;
+
+#[async_trait]
+impl StreamAppender for FailingAppender {
+    /// Rejects every append so the event remains unpublished and gated.
+    async fn append(&self, _records: Vec<OutboxRecord>) -> verglas_do_turso::Result<()> {
+        Err(verglas_do_turso::Error::StreamAppend(
+            "test Stream unavailable".to_owned(),
+        ))
+    }
+}
 
 /// Scripted event handler used only to exercise the real endpoint protocol seam.
 #[derive(Default)]
@@ -83,7 +112,27 @@ impl EventDispatcher for ScriptedDispatcher {
         _bindings: Arc<dyn WorkerBindings>,
         request: Request,
     ) -> Result<PendingEvent<Response>, RuntimeError> {
-        let (permit, _staged_sockets) = Self::begin(gate, sockets).await;
+        let (permit, staged_sockets) = Self::begin(gate, sockets).await;
+        if request.uri == "/publish" || request.uri == "/publish-fail" {
+            storage
+                .stream_send(
+                    "STREAM".to_owned(),
+                    "stream-id".to_owned(),
+                    r#"[{"value":1}]"#.to_owned(),
+                )
+                .await
+                .map_err(Self::host_failure)?;
+            staged_sockets
+                .send(7, b"published".to_vec())
+                .await
+                .map_err(Self::host_failure)?;
+            if request.uri == "/publish-fail" {
+                permit.abort();
+                return Err(RuntimeError::Handler {
+                    message: "scripted publication failure".to_owned(),
+                });
+            }
+        }
         if request.uri == "/fail" {
             storage
                 .put("fetch-failure".to_owned(), b"must-not-commit".to_vec())
@@ -225,6 +274,40 @@ async fn start_endpoint(
     start_endpoint_with_dispatcher(directory, Arc::new(ScriptedDispatcher::default())).await
 }
 
+/// Starts an endpoint with an explicit Stream appender failure or probe.
+async fn start_endpoint_with_appender(
+    directory: &tempfile::TempDir,
+    appender: Arc<dyn StreamAppender>,
+) -> Result<
+    (
+        Arc<TursoStore>,
+        tokio::task::JoinHandle<Result<(), verglas_runtime::EventEndpointError>>,
+    ),
+    Box<dyn Error>,
+> {
+    let store = Arc::new(
+        TursoStore::open_for_test(directory.path().join("worker.db"), "endpoint-test").await?,
+    );
+    store.set_stream_appender(appender).await;
+    let path = directory.path().join("events.sock");
+    let mut endpoint = EventEndpoint::bind(
+        &path,
+        Arc::clone(&store),
+        Arc::new(ScriptedDispatcher::default()),
+    )
+    .await?;
+    let task = tokio::spawn(async move { endpoint.run().await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            task.abort();
+            return Err("event socket did not bind".into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok((store, task))
+}
+
 /// Opens the endpoint and returns writable and readable stream halves.
 async fn connect(
     directory: &tempfile::TempDir,
@@ -357,6 +440,67 @@ async fn websocket_effects_follow_turso_commit_and_failures_rollback() -> Result
     let failed_view = store.begin_event().await?;
     assert_eq!(failed_view.get_kv("message:fail").await?, None);
     failed_view.rollback().await?;
+    task.abort();
+    Ok(())
+}
+
+/// Handler failure before source commit releases neither Stream append nor socket output.
+#[tokio::test]
+async fn publication_before_commit_has_no_append_or_effect() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let appender = Arc::new(CountingAppender::default());
+    let (store, task) = start_endpoint_with_appender(&directory, appender.clone()).await?;
+    let (mut writer, mut reader) = connect(&directory).await?;
+    send_frame(&mut writer, json!({ "type": "ws-open", "ws": 7 })).await?;
+    let failure = round_trip(
+        &mut writer,
+        &mut reader,
+        json!({
+            "type": "fetch", "id": 30, "method": "POST", "url": "/publish-fail",
+            "headers": [], "body_b64": ""
+        }),
+    )
+    .await?;
+    assert_eq!(failure["type"], "error");
+    assert_eq!(appender.calls.load(Ordering::SeqCst), 0);
+    let event = store.begin_event().await?;
+    event.rollback().await?;
+    assert!(store.pending_outbox(10).await?.is_empty());
+    task.abort();
+    Ok(())
+}
+
+/// A failed Stream acknowledgement keeps effects gated and blocks the next event.
+#[tokio::test]
+async fn publication_ack_failure_blocks_effects_and_next_event() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let (store, task) = start_endpoint_with_appender(&directory, Arc::new(FailingAppender)).await?;
+    let (mut writer, mut reader) = connect(&directory).await?;
+    send_frame(&mut writer, json!({ "type": "ws-open", "ws": 7 })).await?;
+    let failure = round_trip(
+        &mut writer,
+        &mut reader,
+        json!({
+            "type": "fetch", "id": 31, "method": "POST", "url": "/publish",
+            "headers": [], "body_b64": ""
+        }),
+    )
+    .await?;
+    assert_eq!(failure["type"], "error");
+    let next = round_trip(
+        &mut writer,
+        &mut reader,
+        json!({
+            "type": "fetch", "id": 32, "method": "GET", "url": "/next",
+            "headers": [], "body_b64": ""
+        }),
+    )
+    .await?;
+    assert_eq!(next["type"], "error");
+    assert!(matches!(
+        store.begin_event().await,
+        Err(verglas_do_turso::Error::OutboxInFlight)
+    ));
     task.abort();
     Ok(())
 }

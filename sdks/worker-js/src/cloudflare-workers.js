@@ -118,7 +118,7 @@ export function createWorker(project, manifest, options = {}) {
  */
 export function createHandler(project, manifest, options = {}) {
   const transport = requireTransport(options);
-  const env = createEnvironment(manifest, transport);
+  const env = createEnvironment(manifest, transport, { transactionalStreams: true });
   const classSelection = selectClassName(manifest);
   const className = classSelection.name;
   const objectConstructor = className ? project?.[className] : undefined;
@@ -207,14 +207,19 @@ function requireTransport(options) {
   return options.transport;
 }
 
-/** @param {object} manifest @param {object} transport @returns {object} */
-function createEnvironment(manifest, transport) {
+/** @param {object} manifest @param {object} transport @param {{transactionalStreams?: boolean}} [options] @returns {object} */
+function createEnvironment(manifest, transport, options = {}) {
   const env = { ...(manifest?.vars ?? {}) };
   for (const binding of manifest?.bindings ?? []) {
     env[binding.name] = createDurableObjectBinding(binding.name, transport);
   }
   for (const pipeline of manifest?.pipelines ?? []) {
-    env[pipeline.binding] = createStreamBinding(pipeline.binding, pipeline.stream, transport);
+    env[pipeline.binding] = createStreamBinding(
+      pipeline.binding,
+      pipeline.stream,
+      transport,
+      { transactional: options.transactionalStreams === true },
+    );
   }
   return Object.freeze(env);
 }

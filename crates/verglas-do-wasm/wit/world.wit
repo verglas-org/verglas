@@ -1,8 +1,8 @@
 // The verglas:do world: the ABI every Durable Object Worker component targets.
 //
 // Exports are the event surface the host (verglasd) invokes; imports are the
-// capabilities the host grants. Storage is bound in-process to the DO engine,
-// never over a network hop.
+// capabilities the host grants. Storage is bound in-process to the Turso-backed
+// DO runtime, never over a network hop.
 
 package verglas:do-worker@0.1.0;
 
@@ -54,12 +54,12 @@ interface storage {
   %list: func(prefix: string, limit: u32) -> result<list<string>, handler-error>;
 
   /// Executes one SQL statement against the DO's relational surface inside
-  /// the event's transaction. Returns Arrow IPC stream bytes.
-  sql: func(statement: string) -> result<list<u8>, handler-error>;
-
-  /// Executes the same SQL statement as `sql`, with rows encoded as one JSON
-  /// array of objects. This is a second encoding, not a fallback.
+  /// the event's transaction, with rows encoded as one JSON array of objects.
   sql-rows: func(statement: string) -> result<string, handler-error>;
+
+  /// Stages logical JSON records for one configured Stream in this event's
+  /// transaction. The host assigns deterministic source event identities.
+  stream-send: func(stream-binding: string, stream-name: string, records: string) -> result<_, handler-error>;
 
   /// Sets or replaces the DO's single durable alarm. Committed with the
   /// event's transaction; the platform wakes the DO at the deadline.
