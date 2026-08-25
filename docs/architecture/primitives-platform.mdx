@@ -241,12 +241,16 @@ Objects joined by deterministic Iceberg batch identities.
 
 ## Management and observability
 
-The management API follows Cloudflare's current resource split under
-`/pipelines/v1`: list/create/get/delete Pipelines, Streams, and Sinks; PATCH is
-limited to Stream HTTP and Worker-binding settings. Stream schemas, Sink
-configuration, and Pipeline SQL are immutable. Unknown fields are hard errors.
-The setup command creates a Stream, Sink, and Pipeline and emits the Worker
-binding:
+The Verglas Cloud control plane owns the public management API. This repository
+defines and runs the six-product data plane plus the strict provisioning and
+manifest contracts consumed by that control plane; it does not mount a public
+`/pipelines/v1` service.
+
+The Cloud API follows Cloudflare's current resource split under `/pipelines/v1`:
+list/create/get/delete Pipelines, Streams, and Sinks; PATCH is limited to Stream
+HTTP and Worker-binding settings. Stream schemas, Sink configuration, and
+Pipeline SQL are immutable. Unknown fields are hard errors. The Cloud setup
+command creates a Stream, Sink, and Pipeline and emits the Worker binding:
 
 ```toml
 [[pipelines]]
@@ -309,10 +313,11 @@ deleted, ignored, or stripped of assertions.
   system resource is implemented as a prebuilt Worker/DO deployment. No job
   Worker, direct DO public route, standalone queue engine, custom DO database,
   or direct DO-to-Iceberg path remains.
-- **PP9 — Cloudflare-shaped management.** Wrangler/API create/list/get/delete,
-  immutable resource behavior, Stream binding generation, schema validation,
-  limits, and metrics match the documented current surface; every deliberate
-  extension or documentation gap is labeled.
+- **PP9 — Cloudflare-shaped management contract.** Verglas manifests and
+  provisioning inputs support the Cloud control plane's create/list/get/delete
+  API, immutable resource behavior, Stream binding generation, schema
+  validation, limits, and metrics. The public API itself lives in Verglas Cloud;
+  every deliberate extension or documentation gap is labeled.
 - **PP10 — end-to-end and regression.** JS and Python examples run Worker → DO
   → Stream → Pipeline → Iceberg Sink → Catalog after cold restart. Existing
   cache/catalog suites remain green; workspace formatting, strict clippy,
