@@ -6,21 +6,31 @@ use verglas_gateway::{Manifest, ManifestError};
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn source(extra: &str) -> String {
-    format!(
-        r#"{{
-            "name":"counter",
-            "main":"src/index.ts",
-            "durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},
-            "artifacts":{{
-                "worker":{{"digest":"{DIGEST}","component_dir":"./components"}},
-                "durable_object":{{"digest":"{DIGEST}","component_dir":"./components"}},
-                "stream":{{"digest":"{DIGEST}","component_dir":"./components"}}
-            }},
-            "data_root":"./state",
-            "turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}
-            {extra}
-        }}"#
-    )
+    let mut source = serde_json::json!({
+        "name": "counter",
+        "main": "src/index.ts",
+        "durable_objects": {"bindings": [{"name": "COUNTER", "class_name": "Counter"}]},
+        "artifacts": {
+            "worker": {"digest": DIGEST, "component_dir": "./components"},
+            "durable_object": {"digest": DIGEST, "component_dir": "./components"},
+            "stream": {"digest": DIGEST, "component_dir": "./components"}
+        },
+        "data_root": "./state",
+        "turso": {
+            "url_template": "https://turso.test/{binding}/{do_id}",
+            "token_file": "/tokens/{binding}.token"
+        }
+    })
+    .to_string();
+    if !extra.is_empty() {
+        let extra = extra.strip_prefix(',').unwrap_or(extra);
+        let closing = source.pop().expect("JSON object has a closing brace");
+        debug_assert_eq!(closing, '}');
+        source.push(',');
+        source.push_str(extra);
+        source.push(closing);
+    }
+    source
 }
 
 #[test]
@@ -55,7 +65,13 @@ fn compatibility_migrations_and_vars_are_preserved() {
 
 #[test]
 fn missing_turso_for_a_worker_binding_fails_closed() {
-    let source = source("").replace(",\n            \"turso\":{\"url_template\":\"https://turso.test/{binding}/{do_id}\",\"token_file\":\"/tokens/{binding}.token\"}", "");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
+    value
+        .as_object_mut()
+        .expect("base test manifest is an object")
+        .remove("turso");
+    let source = value.to_string();
     assert!(matches!(
         Manifest::parse(&source),
         Err(ManifestError::MissingField { field: "turso" })

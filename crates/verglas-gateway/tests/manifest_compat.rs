@@ -7,22 +7,21 @@ const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 /// Preserves accepted compatibility, migration, and environment metadata.
 #[test]
 fn accepts_compatibility_migrations_and_vars() {
-    let source = format!(
-        r#"{{
-            "name": "counter",
-            "main": "src/index.ts",
-            "compatibility_date": "2024-01-01",
-            "compatibility_flags": ["nodejs_compat", "experimental"],
-            "durable_objects": {{"bindings": []}},
-            "migrations": [
-                {{"tag": "v1", "new_classes": ["Counter"]}},
-                {{"tag": "v2", "new_sqlite_classes": ["SqlCounter"]}}
-            ],
-            "vars": {{"API_URL": "https://example.test", "LIMIT": 3}},
-            "artifacts": {{"worker": {{"digest": "{DIGEST}", "component_dir": "./components"}}}},
-            "data_root": "./state"
-        }}"#
-    );
+    let source = serde_json::json!({
+        "name": "counter",
+        "main": "src/index.ts",
+        "compatibility_date": "2024-01-01",
+        "compatibility_flags": ["nodejs_compat", "experimental"],
+        "durable_objects": {"bindings": []},
+        "migrations": [
+            {"tag": "v1", "new_classes": ["Counter"]},
+            {"tag": "v2", "new_sqlite_classes": ["SqlCounter"]}
+        ],
+        "vars": {"API_URL": "https://example.test", "LIMIT": 3},
+        "artifacts": {"worker": {"digest": DIGEST, "component_dir": "./components"}},
+        "data_root": "./state"
+    })
+    .to_string();
     let manifest = Manifest::parse(&source).expect("valid compatibility manifest");
 
     assert_eq!(manifest.compatibility_date(), Some("2024-01-01"));
@@ -50,16 +49,15 @@ fn accepts_compatibility_migrations_and_vars() {
 /// Rejects migration kinds outside the frozen compatibility contract.
 #[test]
 fn rejects_unsupported_migration_kind() {
-    let source = format!(
-        r#"{{
-            "name": "counter",
-            "main": "src/index.ts",
-            "durable_objects": {{"bindings": []}},
-            "migrations": [{{"tag": "v1", "deleted_classes": ["Counter"]}}],
-            "artifacts": {{"worker": {{"digest": "{DIGEST}", "component_dir": "./components"}}}},
-            "data_root": "./state"
-        }}"#
-    );
+    let source = serde_json::json!({
+        "name": "counter",
+        "main": "src/index.ts",
+        "durable_objects": {"bindings": []},
+        "migrations": [{"tag": "v1", "deleted_classes": ["Counter"]}],
+        "artifacts": {"worker": {"digest": DIGEST, "component_dir": "./components"}},
+        "data_root": "./state"
+    })
+    .to_string();
 
     let error = Manifest::parse(&source).expect_err("unsupported migration must fail");
     assert!(matches!(
