@@ -54,3 +54,10 @@ fn obsolete_test_targets_are_deleted() {
         );
     }
 }
+
+/// The host daemon exposes one explicit operator path for Catalog runtime startup.
+#[test]
+fn host_configuration_declares_catalog_host_config_option() {
+    let host = read("src/bin/verglas-celld.rs");
+    assert!(host.contains("--catalog-host-config"));
+}

@@ -50,6 +50,9 @@ pub enum SupervisorError {
     /// Process or filesystem setup failed.
     #[error("child process I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// A Catalog child requested privileged runtime startup without operator configuration.
+    #[error("Catalog runtime host config path is not configured")]
+    CatalogHostConfigNotConfigured,
     /// The DO identity could escape or alias its isolated directory.
     #[error("invalid Durable Object identity: {0}")]
     InvalidDoId(String),
@@ -101,6 +104,7 @@ impl From<ProvisionError> for SupervisorError {
         match error {
             ProvisionError::Unsupported { operation } => Self::UnsupportedProvisioner(operation),
             ProvisionError::Io(error) => Self::Io(error),
+            ProvisionError::CatalogHostConfigNotConfigured => Self::CatalogHostConfigNotConfigured,
             ProvisionError::Exited { do_id, status } => Self::Exited { do_id, status },
             ProvisionError::InvalidSocket(do_id) => Self::InvalidSocket(do_id),
             ProvisionError::ReadinessTimeout(do_id) => Self::ReadinessTimeout(do_id),

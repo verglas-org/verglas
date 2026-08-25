@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use verglas_celld::{ChildCommand, ControlServer, HostId, HostSupervisor, ManagementApi};
+use verglas_celld::{
+    ChildCommand, ControlServer, HostId, HostSupervisor, LocalProcessProvisioner, ManagementApi,
+};
 
 struct Config {
     host_id: String,
@@ -15,6 +17,8 @@ struct Config {
     child_program: PathBuf,
     control_socket: Option<PathBuf>,
     management_bind: Option<SocketAddr>,
+    /// Optional operator-owned startup configuration for Catalog runtime children.
+    catalog_host_config: Option<PathBuf>,
 }
 
 impl Config {
@@ -26,6 +30,7 @@ impl Config {
         let mut child_program = None;
         let mut control_socket = None;
         let mut management_bind = None;
+        let mut catalog_host_config = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--host-id" => host_id = Some(next_value(&mut arguments, "--host-id")?),
@@ -42,6 +47,12 @@ impl Config {
                         format!("invalid --management-bind address {value}: {error}")
                     })?);
                 }
+                "--catalog-host-config" => {
+                    catalog_host_config = Some(PathBuf::from(next_value(
+                        &mut arguments,
+                        "--catalog-host-config",
+                    )?));
+                }
                 "--help" => return Err(usage().to_owned()),
                 other => return Err(format!("unknown argument {other}\n{}", usage())),
             }
@@ -52,6 +63,7 @@ impl Config {
             child_program: child_program.ok_or_else(|| format!("missing --child\n{}", usage()))?,
             control_socket,
             management_bind,
+            catalog_host_config,
         })
     }
 
@@ -75,7 +87,7 @@ fn next_value(
 
 /// Returns the one supported command-line shape.
 fn usage() -> &'static str {
-    "usage: verglas-celld --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT]"
+    "usage: verglas-celld --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT] [--catalog-host-config PATH]"
 }
 
 /// Runs the control endpoint until termination or a fatal socket error.
@@ -89,10 +101,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let control_path = config.control_path();
-    let supervisor = Arc::new(Mutex::new(HostSupervisor::new(
+    let provisioner = match config.catalog_host_config {
+        Some(path) => LocalProcessProvisioner::new().with_catalog_host_config(path),
+        None => LocalProcessProvisioner::new(),
+    };
+    let supervisor = Arc::new(Mutex::new(HostSupervisor::with_provisioner(
         HostId::new(config.host_id),
         &config.root,
         ChildCommand::new(config.child_program),
+        Arc::new(provisioner),
     )));
     let mut server = ControlServer::bind_shared(&control_path, supervisor.clone()).await?;
     eprintln!("verglas-celld control socket: {}", server.path().display());

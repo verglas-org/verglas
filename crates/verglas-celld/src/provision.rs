@@ -1,9 +1,10 @@
 //! Process provisioning for one Turso-backed Durable Object Worker.
 //!
-//! The local implementation forwards the known runtime CLI contract and retains
-//! the exact host capability declaration in the typed request. Cloud placement
-//! and the external lease-validating Turso sync ingress remain cloud
-//! responsibilities; celld never invents a second ownership or CAS protocol.
+//! The local implementation forwards the known runtime CLI contract and passes
+//! the operator-owned Catalog startup path only for the exact host capability
+//! declaration. Cloud placement and the external lease-validating Turso sync
+//! ingress remain cloud responsibilities; celld never invents a second ownership
+//! or CAS protocol.
 
 use std::future::Future;
 use std::os::unix::fs::FileTypeExt;
@@ -32,6 +33,9 @@ pub enum ProvisionError {
     /// A local process or filesystem operation failed.
     #[error("child process I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// A Catalog child requested privileged runtime startup without operator configuration.
+    #[error("Catalog runtime host config path is not configured")]
+    CatalogHostConfigNotConfigured,
     /// The process exited before binding its private event socket.
     #[error("Durable Object {do_id} exited during launch with {status}")]
     Exited {
@@ -613,13 +617,29 @@ pub trait Provisioner: Send + Sync {
 }
 
 /// Local child-process substrate used by development, tests, and `verglas-runtime`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LocalProcessProvisioner;
+#[derive(Debug, Clone, Default)]
+pub struct LocalProcessProvisioner {
+    /// Optional host-owned startup configuration exposed only to Catalog children.
+    catalog_host_config: Option<PathBuf>,
+}
 
 impl LocalProcessProvisioner {
-    /// Creates the local process provisioner without external state.
+    /// Creates the local process provisioner without Catalog startup configuration.
     pub const fn new() -> Self {
-        Self
+        Self {
+            catalog_host_config: None,
+        }
+    }
+
+    /// Configures the operator-owned path passed to Catalog runtime children.
+    pub fn with_catalog_host_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.catalog_host_config = Some(path.into());
+        self
+    }
+
+    /// Returns the configured operator-owned Catalog startup path, if any.
+    pub fn catalog_host_config(&self) -> Option<&Path> {
+        self.catalog_host_config.as_deref()
     }
 }
 
@@ -649,6 +669,22 @@ impl Provisioner for LocalProcessProvisioner {
     /// Creates one isolated local process with the exact runtime CLI arguments.
     fn spawn<'a>(&'a self, request: ProvisionRequest) -> ProvisionFuture<'a, ProvisionedChild> {
         Box::pin(async move {
+            let catalog_host_config = match request.host_service() {
+                Some(host_service)
+                    if host_service.binding() == "ICEBERG_COMMIT"
+                        && host_service.service() == "verglas-runtime" =>
+                {
+                    let path = self
+                        .catalog_host_config
+                        .clone()
+                        .ok_or(ProvisionError::CatalogHostConfigNotConfigured)?;
+                    if path.as_os_str().is_empty() {
+                        return Err(ProvisionError::CatalogHostConfigNotConfigured);
+                    }
+                    Some(path)
+                }
+                _ => None,
+            };
             tokio::fs::create_dir_all(request.data_dir()).await?;
             let event_socket = request.component().event_socket();
             match tokio::fs::remove_file(event_socket).await {
@@ -656,8 +692,7 @@ impl Provisioner for LocalProcessProvisioner {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ProvisionError::from(error)),
             }
-            // `verglas-runtime` has no startup input for this declaration yet. Keep it
-            // in the typed provisioning request instead of inventing an ignored CLI flag.
+            // The privileged startup path is selected only for the exact Catalog binding.
             let mut command = Command::new(request.program());
             command
                 .args(request.args())
@@ -680,6 +715,11 @@ impl Provisioner for LocalProcessProvisioner {
                 .kill_on_drop(true);
             if let Some(cache_dir) = request.component().cwasm_cache_dir() {
                 command.arg("--cwasm-cache-dir").arg(cache_dir);
+            }
+            if let Some(catalog_host_config) = catalog_host_config {
+                command
+                    .arg("--catalog-host-config")
+                    .arg(catalog_host_config);
             }
             command.arg("--event-socket").arg(event_socket);
             let resource_limits = request.resource_limits().clone();
