@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn every_workspace_dependency_is_referenced_or_explicitly_preserved() {
+fn every_workspace_dependency_is_referenced() {
     let root = repository_root();
     let root_manifest = read_manifest(&root.join("Cargo.toml"));
     let declared = workspace_dependency_names(&root_manifest);
@@ -19,27 +19,13 @@ fn every_workspace_dependency_is_referenced_or_explicitly_preserved() {
         collect_workspace_references(&manifest, &mut referenced);
     }
 
-    for preserved in PRESERVED_UNUSED {
-        assert!(
-            declared.contains(*preserved),
-            "preserved workspace dependency {preserved:?} is missing"
-        );
-    }
-
-    let unused: Vec<_> = declared
-        .difference(&referenced)
-        .filter(|name| !PRESERVED_UNUSED.contains(&name.as_str()))
-        .cloned()
-        .collect();
+    let unused: Vec<_> = declared.difference(&referenced).cloned().collect();
     assert!(
         unused.is_empty(),
         "workspace dependencies are not referenced by retained manifests: {}",
         unused.join(", ")
     );
 }
-
-/// Lists declarations that intentionally survive while runtime wiring lands.
-const PRESERVED_UNUSED: &[&str] = &["verglas-cache", "verglas-s3"];
 
 /// Resolves the checkout root from this integration test's crate directory.
 fn repository_root() -> PathBuf {
