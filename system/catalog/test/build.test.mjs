@@ -19,9 +19,11 @@ test('Catalog builds as the Worker/DO service world without WASI', async (t) => 
   assert.equal(manifest.name, 'verglas-catalog');
   assert.deepEqual(manifest.durable_objects.bindings, [
     { name: 'CATALOG_DO', class_name: 'Catalog' },
-    { name: 'AUTHORITY', class_name: 'Catalog' },
   ]);
-  assert.equal(manifest.vars.CATALOG_AUTHORITY_BINDING, 'AUTHORITY');
+  assert.deepEqual(manifest.services, [
+    { binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' },
+  ]);
+  assert.equal(manifest.vars.CATALOG_AUTHORITY_BINDING, undefined);
   assert.equal(manifest.vars.CATALOG_WAREHOUSE, 'warehouse');
   assert.equal(manifest.vars.CATALOG_SINK_ID, 'primary');
 

@@ -43,7 +43,9 @@ class PersistedHost {
       if (!this.catalogHandler) throw new Error('Catalog handler is not attached');
       return this.catalogHandler.fetch(request);
     }
-    if (binding === 'AUTHORITY') return this.authorityFetch(request, object);
+    if (binding === 'ICEBERG_COMMIT' && object === 'verglas-runtime') {
+      return this.authorityFetch(request, object);
+    }
     throw new Error(`unexpected binding ${binding} object ${object}`);
   }
 
@@ -149,12 +151,12 @@ function manifest(vars = {}) {
   return {
     bindings: [
       { name: 'CATALOG_DO', class_name: 'Catalog' },
-      { name: 'AUTHORITY', class_name: 'Catalog' },
+    ],
+    services: [
+      { binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' },
     ],
     vars: {
       CATALOG_ID: 'warehouse',
-      CATALOG_AUTHORITY_BINDING: 'AUTHORITY',
-      CATALOG_AUTHORITY_OBJECT: 'warehouse',
       CATALOG_WAREHOUSE: 'warehouse',
       CATALOG_BUCKET: 'lake',
       CATALOG_NAMESPACE: 'analytics',
@@ -192,23 +194,36 @@ async function fixture(t, vars = {}) {
   return { loaded, directory, path, host, handler };
 }
 
-test('forwards standard REST methods, path, body, and authorization headers', async (t) => {
+test('owns namespace and table REST state across restart without a capability call', async (t) => {
   const fixtureValue = await fixture(t);
   const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
-  const body = JSON.stringify({ table: 'events' });
-  const result = await worker.fetch(publicRequest('POST', 'https://catalog.example/v1/namespaces/analytics/tables?detail=true', body, {
-    authorization: 'Bearer caller-token',
-    'x-request-id': 'request-7',
-    'content-type': 'application/json',
-  }));
-  assert.equal(result.status, 200, decoder.decode(result.body));
-  assert.equal(fixtureValue.host.authorityCalls.length, 1);
-  const call = fixtureValue.host.authorityCalls[0];
-  assert.equal(call.request.method, 'POST');
-  assert.equal(call.request.uri, 'https://verglas.internal/v1/namespaces/analytics/tables?detail=true');
-  assert.equal(call.request.headers.find(([name]) => name === 'authorization')?.[1], 'Bearer caller-token');
-  assert.equal(call.request.headers.find(([name]) => name === 'x-request-id')?.[1], 'request-7');
-  assert.equal(call.body, body);
+  const namespace = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces',
+    JSON.stringify({ namespace: ['analytics'], properties: { owner: 'test' } }),
+    { 'content-type': 'application/json' },
+  ));
+  assert.equal(namespace.status, 200, decoder.decode(namespace.body));
+  const table = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics/tables',
+    JSON.stringify({ name: 'events', schema: { type: 'struct', 'schema-id': 0, fields: [] } }),
+    { 'content-type': 'application/json' },
+  ));
+  assert.equal(table.status, 200, decoder.decode(table.body));
+  assert.equal(fixtureValue.host.authorityCalls.length, 0);
+
+  await makeHandler(fixtureValue.loaded.project, fixtureValue.host);
+  const restarted = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
+  const loaded = await restarted.fetch(publicRequest(
+    'GET',
+    'https://catalog.example/v1/namespaces/analytics/tables/events',
+  ));
+  assert.equal(loaded.status, 200, decoder.decode(loaded.body));
+  const payload = await readJson(loaded);
+  assert.equal(payload.metadata.name, 'events');
+  assert.deepEqual(payload.metadata.schema, { type: 'struct', 'schema-id': 0, fields: [] });
+  assert.equal(fixtureValue.host.authorityCalls.length, 0);
 });
 
 test('does not expose commit or status on the public Worker', async (t) => {
@@ -241,7 +256,7 @@ test('commits a valid batch and exact ledger replay makes one authority call', a
   });
   assert.equal(fixtureValue.host.authorityCalls.length, 1);
   const call = fixtureValue.host.authorityCalls[0];
-  assert.equal(call.object, 'warehouse');
+  assert.equal(call.object, 'verglas-runtime');
   assert.equal(call.request.method, 'POST');
   assert.equal(call.request.uri, 'https://verglas.internal/catalog/commit');
   assert.equal(call.request.headers.find(([name]) => name === 'x-verglas-sink-id')?.[1], 'primary');
@@ -364,11 +379,24 @@ test('an authority receipt mismatch is rejected without a ledger row', async (t)
   assert.equal((await readJson(status)).confirmed_batches, 0);
 });
 
+test('Catalog declares one runtime commit capability and no recursive authority object', async () => {
+  const manifest = JSON.parse(await readFile(join(root, 'wrangler.jsonc'), 'utf8'));
+  assert.deepEqual(manifest.durable_objects.bindings, [
+    { name: 'CATALOG_DO', class_name: 'Catalog' },
+  ]);
+  assert.deepEqual(manifest.services, [
+    { binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' },
+  ]);
+  assert.equal(manifest.vars.CATALOG_AUTHORITY_BINDING, undefined);
+  assert.equal(manifest.vars.CATALOG_AUTHORITY_OBJECT, undefined);
+});
+
 test('Catalog source has no object-store, credentials, Parquet, or alternate authority implementation', async () => {
-  const files = ['worker.js', 'wrangler.jsonc', 'package.json'];
+  const files = ['worker.js', 'wrangler.jsonc', 'package.json', 'README.md'];
   const joined = (await Promise.all(files.map((file) => readFile(join(root, file), 'utf8')))).join('\n');
-  assert.match(joined, /CATALOG_AUTHORITY_BINDING/);
+  assert.match(joined, /ICEBERG_COMMIT/);
   assert.match(joined, /catalog\/commit/iu);
+  assert.doesNotMatch(joined, /CATALOG_AUTHORITY_(?:BINDING|OBJECT)|cache-node/iu);
   assert.doesNotMatch(joined, /(?:node:|npm:|@aws-sdk|R2Object|S3Client|parquet-writer|AWS_ACCESS_KEY|SECRET_ACCESS_KEY)/u);
   assert.doesNotMatch(joined, /IcebergCommitter|VerifiedIcebergArchive|storage\.bucket|object-store/iu);
 });

@@ -217,6 +217,7 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
       migrations: manifest.migrations,
       vars: manifest.vars,
       ...(manifest.pipelines === undefined ? {} : { pipelines: manifest.pipelines }),
+      ...(manifest.services === undefined ? {} : { services: manifest.services }),
       artifacts,
     };
     const manifestPath = join(outputDir, 'manifest.out.json');

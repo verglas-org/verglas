@@ -1,7 +1,8 @@
 /**
  * Prebuilt Iceberg Catalog Worker and Durable Object.
- * The object owns only immutable deployment identity and commit receipts. All
- * catalog metadata and storage authority remain behind the injected binding.
+ * The object owns immutable deployment identity, REST namespace/table state,
+ * and commit receipts. Only deterministic Iceberg publication crosses the
+ * private runtime capability binding.
  */
 
 import { DurableObject } from 'cloudflare:workers';
@@ -19,9 +20,10 @@ export const MAX_ROLL_SIZE_BYTES = 512 * 1024 * 1024;
 
 const CONFIG_TABLE = 'catalog_config';
 const LEDGER_TABLE = 'catalog_ledger';
+const NAMESPACE_TABLE = 'catalog_namespaces';
+const TABLE_TABLE = 'catalog_tables';
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const BINDING_NAME = /^[A-Za-z_][A-Za-z0-9_$]{0,127}$/u;
 const LOCATION_MAX_LENGTH = 255;
 const COMPRESSION = new Set(['gzip', 'lz4', 'snappy', 'uncompressed', 'zstd']);
 const COMMIT_FIELDS = new Set([
@@ -117,7 +119,7 @@ export class Catalog extends DurableObject {
     const method = request.method.toUpperCase();
     if (method === 'POST' && url.pathname === CATALOG_COMMIT_PATH) return this.#receiveCommit(request);
     if (method === 'GET' && url.pathname === CATALOG_STATUS_PATH) return this.#statusResponse();
-    if (isPublicRestRequest(method, url.pathname)) return this.#proxyRest(request);
+    if (isPublicRestRequest(method, url.pathname)) return this.#handleRest(request);
     return new Response('not found', { status: 404 });
   }
 
@@ -164,25 +166,49 @@ export class Catalog extends DurableObject {
   }
 
   /**
-   * Forwards one allowlisted REST request without adding provider state or
-   * changing caller headers and body bytes.
+   * Serves the bounded namespace and table registry from this object's Turso database.
+   * Iceberg metadata publication remains an internal runtime capability.
    * @param {Request} request
    * @returns {Promise<Response>}
    */
-  async #proxyRest(request) {
-    const url = new URL(request.url);
-    const method = request.method.toUpperCase();
-    const body = method === 'GET' || method === 'HEAD' ? undefined : new Uint8Array(await request.arrayBuffer());
-    const target = new URL(`https://verglas.internal${url.pathname}${url.search}`);
-    const forwarded = new Request(target, {
-      method,
-      headers: new Headers(request.headers),
-      ...(body === undefined ? {} : { body }),
-    });
+  async #handleRest(request) {
     try {
-      return await bindingFetch(this.env[this.#config.authorityBinding], this.#config.authorityObject, forwarded);
+      const url = new URL(request.url);
+      const method = request.method.toUpperCase();
+      if (method === 'GET' && url.pathname === REST_CONFIG_PATH) {
+        return jsonResponse({ defaults: { warehouse: this.#config.warehouse } });
+      }
+      if (url.pathname === '/v1/namespaces' && method === 'POST') {
+        const body = await readRestJson(request);
+        const namespace = namespaceName(body.namespace);
+        const properties = plainObject(body.properties ?? {}, 'properties');
+        await execute(this.ctx, `INSERT INTO ${NAMESPACE_TABLE} (name, properties_json) VALUES (?, ?)`, namespace, canonicalJson(properties));
+        return jsonResponse({ namespace: [namespace], properties });
+      }
+      const tableMatch = /^\/v1\/namespaces\/([^/]+)\/tables\/([^/]+)$/u.exec(url.pathname);
+      if (tableMatch && (method === 'GET' || method === 'HEAD')) {
+        const namespace = decodeURIComponent(tableMatch[1]);
+        const name = decodeURIComponent(tableMatch[2]);
+        const rows = await execute(this.ctx, `SELECT metadata_json FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace, name);
+        if (!rows[0]) return new Response('not found', { status: 404 });
+        const response = jsonResponse({ metadata: JSON.parse(String(rows[0].metadata_json)) });
+        return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+      }
+      const tablesMatch = /^\/v1\/namespaces\/([^/]+)\/tables$/u.exec(url.pathname);
+      if (tablesMatch && method === 'POST') {
+        const namespace = decodeURIComponent(tablesMatch[1]);
+        const body = await readRestJson(request);
+        const name = namedString(body.name, 'table name');
+        const schema = plainObject(body.schema, 'schema');
+        const namespaces = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace);
+        if (!namespaces[0]) throw new RequestError('namespace does not exist', 404);
+        const metadata = { name, namespace: [namespace], schema };
+        await execute(this.ctx, `INSERT INTO ${TABLE_TABLE} (namespace, name, metadata_json) VALUES (?, ?, ?)`, namespace, name, canonicalJson(metadata));
+        return jsonResponse({ metadata });
+      }
+      return new Response('not found', { status: 404 });
     } catch (error) {
-      return errorResponse(new AuthorityCommitError(`Catalog authority request failed: ${errorMessage(error)}`), 502);
+      return errorResponse(error, error instanceof RequestError ? error.status : 409);
     }
   }
 
@@ -202,6 +228,30 @@ export class Catalog extends DurableObject {
 }
 
 export default { fetch };
+
+/** Reads one bounded REST JSON object. */
+async function readRestJson(request) {
+  const bytes = new Uint8Array(await request.arrayBuffer());
+  if (bytes.byteLength > MAX_AUTHORITY_RESPONSE_BYTES) throw new RequestError('REST request is too large', 413);
+  try {
+    return plainObject(JSON.parse(textDecoder.decode(bytes)), 'request body');
+  } catch (error) {
+    if (error instanceof RequestError) throw error;
+    throw new RequestError('request body must be valid JSON');
+  }
+}
+
+/** Validates the one-segment namespace form supported by this product. */
+function namespaceName(value) {
+  if (!Array.isArray(value) || value.length !== 1) throw new RequestError('namespace must contain one segment');
+  return namedString(value[0], 'namespace');
+}
+
+/** Validates a plain JSON object. */
+function plainObject(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestError(`${field} must be an object`);
+  return value;
+}
 
 /**
  * Marks malformed input with a stable status and message.
@@ -240,8 +290,6 @@ class AuthorityCommitError extends Error {
  */
 function validateConfiguration(env) {
   const catalogId = namedString(env.CATALOG_ID, 'CATALOG_ID');
-  const authorityBinding = bindingString(env.CATALOG_AUTHORITY_BINDING, 'CATALOG_AUTHORITY_BINDING');
-  const authorityObject = namedString(env.CATALOG_AUTHORITY_OBJECT, 'CATALOG_AUTHORITY_OBJECT');
   const warehouse = locationString(env.CATALOG_WAREHOUSE, 'CATALOG_WAREHOUSE');
   const bucket = locationString(env.CATALOG_BUCKET, 'CATALOG_BUCKET');
   const namespace = locationString(env.CATALOG_NAMESPACE, 'CATALOG_NAMESPACE');
@@ -249,8 +297,6 @@ function validateConfiguration(env) {
   const sinkId = namedString(env.CATALOG_SINK_ID, 'CATALOG_SINK_ID');
   return {
     catalogId,
-    authorityBinding,
-    authorityObject,
     warehouse,
     bucket,
     namespace,
@@ -267,8 +313,6 @@ function validateConfiguration(env) {
 async function completeConfiguration(preliminary) {
   const configJson = canonicalJson({
     catalog_id: preliminary.catalogId,
-    authority_binding: preliminary.authorityBinding,
-    authority_object: preliminary.authorityObject,
     warehouse: preliminary.warehouse,
     bucket: preliminary.bucket,
     namespace: preliminary.namespace,
@@ -298,6 +342,16 @@ async function createTables(ctx) {
     snapshot_id TEXT NOT NULL,
     rows_committed INTEGER NOT NULL,
     receipt_json TEXT NOT NULL
+  )`);
+  await execute(ctx, `CREATE TABLE IF NOT EXISTS ${NAMESPACE_TABLE} (
+    name TEXT PRIMARY KEY,
+    properties_json TEXT NOT NULL
+  )`);
+  await execute(ctx, `CREATE TABLE IF NOT EXISTS ${TABLE_TABLE} (
+    namespace TEXT NOT NULL,
+    name TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    PRIMARY KEY (namespace, name)
   )`);
 }
 
@@ -475,7 +529,9 @@ async function commitToAuthority(env, config, commit) {
 
   let response;
   try {
-    response = await bindingFetch(env[config.authorityBinding], config.authorityObject, request);
+    const capability = env.ICEBERG_COMMIT;
+    if (!capability || typeof capability.fetch !== 'function') throw new Error('ICEBERG_COMMIT is not configured');
+    response = await capability.fetch(request);
   } catch (error) {
     throw new AuthorityCommitError(`Catalog authority request failed: ${errorMessage(error)}`);
   }
@@ -533,24 +589,6 @@ async function loadLedgerEntry(ctx, batchId) {
 }
 
 /**
- * Calls either a direct service binding or a named Durable Object binding.
- * @param {unknown} binding
- * @param {string} objectName
- * @param {Request} request
- * @returns {Promise<Response>}
- */
-async function bindingFetch(binding, objectName, request) {
-  if (binding && typeof binding.fetch === 'function') return binding.fetch(request);
-  if (binding && typeof binding.idFromName === 'function' && typeof binding.get === 'function') {
-    const id = binding.idFromName(objectName);
-    const stub = binding.get(id);
-    if (!stub || typeof stub.fetch !== 'function') throw new Error(`authority ${objectName} did not return a fetch stub`);
-    return stub.fetch(request);
-  }
-  throw new Error(`Catalog authority binding for ${objectName} is not configured`);
-}
-
-/**
  * Determines whether a method/path pair is a standard public Iceberg REST
  * endpoint. Internal Catalog controls intentionally do not match this set.
  * @param {string} method
@@ -599,19 +637,6 @@ async function execute(ctx, statement, ...bindings) {
 function namedString(value, name) {
   if (typeof value !== 'string' || value.trim() === '' || !NAME.test(value.trim())) {
     throw new Error(`${name} must be an alphanumeric resource name of at most 128 characters`);
-  }
-  return value.trim();
-}
-
-/**
- * Requires a syntactically valid binding identifier.
- * @param {unknown} value
- * @param {string} name
- * @returns {string}
- */
-function bindingString(value, name) {
-  if (typeof value !== 'string' || value.trim() === '' || !BINDING_NAME.test(value.trim())) {
-    throw new Error(`${name} is not a valid binding name`);
   }
   return value.trim();
 }

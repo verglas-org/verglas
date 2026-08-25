@@ -129,6 +129,34 @@ test('worker export builds Cloudflare bindings and awaits waitUntil before compl
   assert.deepEqual(events.sort(), ['COUNTER:alice:GET', 'wait']);
 });
 
+test('service binding fetch preserves declared binding and service target', async () => {
+  const calls = [];
+  const worker = createWorker({
+    default: {
+      async fetch(request, env) {
+        return env.ICEBERG_COMMIT.fetch(request);
+      },
+    },
+  }, {
+    services: [{ binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' }],
+  }, {
+    transport: {
+      doFetch(binding, object, request) {
+        calls.push([binding, object, request.method]);
+        return {
+          status: 204,
+          headers: [],
+          body: new Uint8Array(),
+          acceptWs: undefined,
+        };
+      },
+    },
+  });
+  const response = await worker.fetch({ method: 'POST', uri: 'https://worker.test/commit', headers: [], body: [] });
+  assert.equal(response.status, 204);
+  assert.deepEqual(calls, [['ICEBERG_COMMIT', 'verglas-runtime', 'POST']]);
+});
+
 test('storage adapter uses WIT verbs and structured-clone bytes', async () => {
   const host = new MockHost();
   const state = new DurableObjectState(new DurableObjectId('1'.repeat(64)), host);

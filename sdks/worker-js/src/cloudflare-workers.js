@@ -81,6 +81,23 @@ export function createDurableObjectBinding(bindingName, transport) {
 }
 
 /**
+ * Creates a direct service binding over the existing declared-binding fetch ABI.
+ * @param {string} bindingName
+ * @param {string} serviceName
+ * @param {object} transport
+ * @returns {{fetch: Function}}
+ */
+export function createServiceBinding(bindingName, serviceName, transport) {
+  return Object.freeze({
+    async fetch(input, init) {
+      const request = await requestToRecord(input, init);
+      const result = await transport.doFetch(bindingName, serviceName, request);
+      return responseFromRecord(result);
+    },
+  });
+}
+
+/**
  * Builds the Worker-tier export for the component world. It receives no
  * storage or socket object; those capabilities exist only on DO handler calls.
  * @param {object} project
@@ -220,6 +237,9 @@ function createEnvironment(manifest, transport, options = {}) {
       transport,
       { transactional: options.transactionalStreams === true },
     );
+  }
+  for (const service of manifest?.services ?? []) {
+    env[service.binding] = createServiceBinding(service.binding, service.service, transport);
   }
   return Object.freeze(env);
 }

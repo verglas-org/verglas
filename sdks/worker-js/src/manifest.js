@@ -15,11 +15,13 @@ const topLevelKeys = new Set([
   'migrations',
   'vars',
   'pipelines',
+  'services',
 ]);
 const durableObjectsKeys = new Set(['bindings']);
 const bindingKeys = new Set(['name', 'class_name']);
 const migrationKeys = new Set(['tag', 'new_classes', 'new_sqlite_classes']);
 const pipelineKeys = new Set(['binding', 'stream']);
+const serviceKeys = new Set(['binding', 'service']);
 
 /**
  * Error raised when a project manifest is outside the supported subset.
@@ -247,9 +249,29 @@ function parsePipelines(value) {
 }
 
 /**
+ * Parses a direct Cloudflare service binding.
+ * @param {unknown} value
+ * @returns {Array<{binding: string, service: string}>}
+ */
+function parseServices(value) {
+  if (!Array.isArray(value)) throw new ManifestError('manifest.services must be an array');
+  return value.map((rawService, index) => {
+    if (!rawService || typeof rawService !== 'object' || Array.isArray(rawService)) {
+      throw new ManifestError(`manifest.services[${index}] must be an object`);
+    }
+    const service = /** @type {Record<string, unknown>} */ (rawService);
+    rejectUnknownKeys(service, serviceKeys, `services[${index}]`);
+    return {
+      binding: requiredString(service, 'binding', `manifest.services[${index}]`),
+      service: requiredString(service, 'service', `manifest.services[${index}]`),
+    };
+  });
+}
+
+/**
  * Validates the supported wrangler manifest subset.
  * @param {unknown} raw
- * @returns {{name: string, main: string, compatibility_date?: string, compatibility_flags: string[], bindings: Array<{name: string, class_name: string}>, migrations: Array<{tag: string, new_classes: string[], new_sqlite_classes: string[]}>, vars: Record<string, unknown>, pipelines?: Array<{binding: string, stream: string}>}}
+ * @returns {{name: string, main: string, compatibility_date?: string, compatibility_flags: string[], bindings: Array<{name: string, class_name: string}>, migrations: Array<{tag: string, new_classes: string[], new_sqlite_classes: string[]}>, vars: Record<string, unknown>, pipelines?: Array<{binding: string, stream: string}>, services?: Array<{binding: string, service: string}>}}
  */
 export function parseWranglerManifest(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -299,6 +321,7 @@ export function parseWranglerManifest(raw) {
   }
 
   const pipelines = object.pipelines === undefined ? undefined : parsePipelines(object.pipelines);
+  const services = object.services === undefined ? undefined : parseServices(object.services);
   const names = new Set();
   for (const binding of bindings) {
     if (names.has(binding.name)) {
@@ -312,6 +335,12 @@ export function parseWranglerManifest(raw) {
     }
     names.add(pipeline.binding);
   }
+  for (const service of services ?? []) {
+    if (names.has(service.binding)) {
+      throw new ManifestError(`duplicate binding name: ${service.binding}`);
+    }
+    names.add(service.binding);
+  }
 
   return {
     name,
@@ -322,6 +351,7 @@ export function parseWranglerManifest(raw) {
     migrations,
     vars,
     ...(pipelines === undefined ? {} : { pipelines }),
+    ...(services === undefined ? {} : { services }),
   };
 }
 

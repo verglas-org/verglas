@@ -96,6 +96,37 @@ test('accepts exact pipeline bindings', () => {
   });
 });
 
+test('accepts exact service bindings', () => {
+  const manifest = parseWranglerManifest({
+    name: 'catalog',
+    main: 'worker.js',
+    services: [{ binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' }],
+  });
+  assert.deepEqual(manifest.services, [
+    { binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' },
+  ]);
+});
+
+test('rejects malformed services and cross-kind duplicate binding names', () => {
+  assert.throws(
+    () => parseWranglerManifest({
+      name: 'catalog',
+      main: 'worker.js',
+      services: [{ binding: 'ICEBERG_COMMIT', service: 'verglas-runtime', extra: true }],
+    }),
+    /unknown services\[0\] key.*extra/i,
+  );
+  assert.throws(
+    () => parseWranglerManifest({
+      name: 'catalog',
+      main: 'worker.js',
+      durable_objects: { bindings: [{ name: 'ICEBERG_COMMIT', class_name: 'Catalog' }] },
+      services: [{ binding: 'ICEBERG_COMMIT', service: 'verglas-runtime' }],
+    }),
+    /duplicate binding name.*ICEBERG_COMMIT/i,
+  );
+});
+
 test('rejects unknown pipeline keys and duplicate binding names', () => {
   assert.throws(
     () => parseWranglerManifest({
