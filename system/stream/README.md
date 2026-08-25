@@ -36,8 +36,11 @@ outcomes (`invalid_json`, `not_array`, `request_limit`, `record_limit`,
 returns `accepted`, `invalid`, a contiguous `sequences` array, and ordered
 `errors`; its read response returns
 valid records, `skipped` validation positions, and `next_after` at the last
-scanned sequence. Only processable records participate in downstream exactly-once
-processing. An unstructured successful batch keeps the original
+scanned sequence. For example, a five-record batch with valid positions 1
+and 5 still stores source sequences 1 through 5; its processing read returns
+valid sequences 1 and 5, never renumbering them. Only processable records
+participate in downstream exactly-once processing. An unstructured successful
+batch keeps the original
 `{ accepted, sequences }` acknowledgement shape.
 
 The hard ceilings are a 5 MiB encoded request, 10,000 records per request, a

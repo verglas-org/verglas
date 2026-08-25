@@ -278,6 +278,20 @@ test('structured schemas preserve invalid ingestion and drop them from processin
       { index: 3, family: 'schema_type_mismatch' },
     ],
   });
+  assert.deepEqual(JSON.parse(host.sqlRows('SELECT sequence, record_json FROM stream_records ORDER BY sequence')).map((row) => ({
+    sequence: Number(row.sequence),
+    record: JSON.parse(row.record_json),
+  })), records.map((record, index) => ({ sequence: index + 1, record })));
+  assert.deepEqual(JSON.parse(host.sqlRows('SELECT sequence, validation_family FROM stream_record_validation ORDER BY sequence')).map((row) => ({
+    sequence: Number(row.sequence),
+    family: row.validation_family,
+  })), [
+    { sequence: 1, family: null },
+    { sequence: 2, family: 'missing_required_field' },
+    { sequence: 3, family: 'unknown_field' },
+    { sequence: 4, family: 'schema_type_mismatch' },
+    { sequence: 5, family: null },
+  ]);
   const first = await readRecords(handler, 0, 2);
   assert.deepEqual(first.body.records.map(({ sequence, record }) => ({ sequence, record })), [
     { sequence: 1, record: { kind: 'ok', count: 1 } },
@@ -293,6 +307,8 @@ test('structured schemas preserve invalid ingestion and drop them from processin
     { sequence: 3, family: 'unknown_field' },
     { sequence: 4, family: 'schema_type_mismatch' },
   ]);
+  const complete = await readRecords(handler, rows.body.next_after, 10);
+  assert.deepEqual(complete.body, { records: [], next_after: 5, skipped: [] });
   const observed = await metrics(handler);
   assert.equal(observed.response.status, 200);
   assert.equal(observed.body.input_bytes, new TextEncoder().encode(JSON.stringify(records)).byteLength);
