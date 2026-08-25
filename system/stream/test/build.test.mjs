@@ -19,7 +19,15 @@ test('Stream builds against the service world with only Worker capabilities', as
   const manifest = JSON.parse(await readFile(result.manifestPath, 'utf8'));
   assert.equal(manifest.name, 'verglas-stream');
   assert.deepEqual(manifest.durable_objects.bindings, [{ name: 'STREAM_DO', class_name: 'Stream' }]);
-  assert.deepEqual(manifest.vars, { STREAM_NAME: 'main' });
+  assert.deepEqual(manifest.vars, {
+    STREAM_NAME: 'main',
+    STREAM_SCHEMA: {
+      fields: [
+        { name: 'kind', type: 'string', required: true },
+        { name: 'payload', type: 'json', required: false },
+      ],
+    },
+  });
 
   const wit = spawnSync(jco, ['wit', result.componentPath], { encoding: 'utf8' });
   assert.equal(wit.status, 0, wit.stderr);

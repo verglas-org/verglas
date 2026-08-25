@@ -76,14 +76,33 @@ async function readRecords(handler, after, limit) {
   return { response, body: await body(response) };
 }
 
-async function makeHandler(project, host) {
+async function makeHandler(project, host, vars = {}) {
   const handler = createHandler(project, {
     bindings: [{ name: 'STREAM_DO', class_name: 'Stream' }],
-    vars: {},
+    vars,
   }, { transport: host });
   await handler.init();
   return handler;
 }
+
+async function metrics(handler) {
+  const response = await handler.fetch(request('GET', 'https://verglas.internal/stream/metrics'));
+  return { response, body: await body(response) };
+}
+
+const STRUCTURED_SCHEMA = {
+  fields: [
+    { name: 'kind', type: 'string', required: true },
+    { name: 'count', type: 'int32', required: false },
+    { name: 'tags', type: 'list', required: false, items: { type: 'string' } },
+    {
+      name: 'metadata',
+      type: 'struct',
+      required: false,
+      fields: [{ name: 'source', type: 'string', required: false }],
+    },
+  ],
+};
 
 test('Stream appends ordered records and gives independent bounded reads', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-state-'));
@@ -227,8 +246,221 @@ test('Worker endpoint fails closed for configured auth and emits configured CORS
   assert.equal((await readRecords(handler, 0, 10)).body.records.length, 1);
 });
 
+test('structured schemas preserve invalid ingestion and drop them from processing reads', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-schema-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const deploymentSchema = structuredClone(STRUCTURED_SCHEMA);
+  const handler = await makeHandler(loaded.project, host, { STREAM_SCHEMA: deploymentSchema });
+  deploymentSchema.fields[0].name = 'mutated-after-deploy';
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  const records = [
+    { kind: 'ok', count: 1 },
+    { count: 2 },
+    { kind: 'ok', extra: true },
+    { kind: 7 },
+    { kind: 'ok', tags: ['a'], metadata: { source: 'test' } },
+  ];
+  const appended = await append(handler, records);
+  assert.equal(appended.status, 200);
+  assert.deepEqual(await body(appended), {
+    accepted: 5,
+    invalid: 3,
+    sequences: [1, 2, 3, 4, 5],
+    errors: [
+      { index: 1, family: 'missing_required_field' },
+      { index: 2, family: 'unknown_field' },
+      { index: 3, family: 'schema_type_mismatch' },
+    ],
+  });
+  const first = await readRecords(handler, 0, 2);
+  assert.deepEqual(first.body.records.map(({ sequence, record }) => ({ sequence, record })), [
+    { sequence: 1, record: { kind: 'ok', count: 1 } },
+  ]);
+  assert.equal(first.body.next_after, 2);
+  assert.deepEqual(first.body.skipped, [{ sequence: 2, family: 'missing_required_field' }]);
+  const rows = await readRecords(handler, first.body.next_after, 10);
+  assert.deepEqual(rows.body.records.map(({ sequence, record }) => ({ sequence, record })), [
+    { sequence: 5, record: { kind: 'ok', tags: ['a'], metadata: { source: 'test' } } },
+  ]);
+  assert.equal(rows.body.next_after, 5);
+  assert.deepEqual(rows.body.skipped, [
+    { sequence: 3, family: 'unknown_field' },
+    { sequence: 4, family: 'schema_type_mismatch' },
+  ]);
+  const observed = await metrics(handler);
+  assert.equal(observed.response.status, 200);
+  assert.equal(observed.body.input_bytes, new TextEncoder().encode(JSON.stringify(records)).byteLength);
+  assert.equal(observed.body.input_records, records.length);
+  assert.equal(observed.body.decode_errors, 3);
+  assert.deepEqual(observed.body.user_errors, {
+    invalid_json: 0,
+    not_array: 0,
+    request_limit: 0,
+    record_limit: 0,
+    field_limit: 0,
+    list_limit: 0,
+    missing_required_field: 1,
+    unknown_field: 1,
+    schema_type_mismatch: 1,
+  });
+  assert.deepEqual(observed.body.extensions, {
+    ordering_violations: 0,
+    backpressure_events: 0,
+    lag_records: 0,
+  });
+});
+
+test('producer retries retain the persisted validation outcome', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-schema-retry-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const handler = await makeHandler(loaded.project, host, { STREAM_SCHEMA: STRUCTURED_SCHEMA });
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  const first = await append(handler, [{ count: 1 }], 'invalid-event');
+  const retry = await append(handler, [{ kind: 'now-valid' }], 'invalid-event');
+  const firstAck = await body(first);
+  assert.deepEqual(await body(retry), firstAck);
+  assert.deepEqual(firstAck, {
+    accepted: 1,
+    invalid: 1,
+    sequences: [1],
+    errors: [{ index: 0, family: 'missing_required_field' }],
+  });
+  const rows = await readRecords(handler, 0, 10);
+  assert.deepEqual(rows.body.records, []);
+  assert.deepEqual(rows.body.skipped, [{ sequence: 1, family: 'missing_required_field' }]);
+});
+
+test('structured schema configuration is immutable across restart and rejects unknown keys', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-schema-restart-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const firstHost = new PersistedHost(path);
+  const firstHandler = await makeHandler(loaded.project, firstHost, { STREAM_SCHEMA: STRUCTURED_SCHEMA });
+  await append(firstHandler, [{ count: 99 }]);
+  await append(firstHandler, [{ kind: 'before' }]);
+  firstHost.close();
+  const secondHost = new PersistedHost(path);
+  const secondHandler = await makeHandler(loaded.project, secondHost, { STREAM_SCHEMA: STRUCTURED_SCHEMA });
+  t.after(() => {
+    secondHost.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  await append(secondHandler, [{ kind: 'after' }]);
+  const rows = await readRecords(secondHandler, 0, 10);
+  assert.deepEqual(rows.body.records.map(({ sequence }) => sequence), [2, 3]);
+  assert.equal(rows.body.next_after, 3);
+  const observed = await metrics(secondHandler);
+  assert.equal(observed.body.input_records, 3);
+  assert.equal(observed.body.decode_errors, 1);
+  assert.equal(observed.body.user_errors.missing_required_field, 1);
+
+  const changedSchema = { fields: [{ name: 'different', type: 'string', required: true }] };
+  const changed = createHandler(loaded.project, {
+    bindings: [{ name: 'STREAM_DO', class_name: 'Stream' }],
+    vars: { STREAM_SCHEMA: changedSchema },
+  }, { transport: secondHost });
+  await changed.init();
+  await assert.rejects(changed.fetch(request('GET', 'https://verglas.internal/stream/metrics')), /immutable Stream schema mismatch/i);
+
+  const unknownHost = new PersistedHost(':memory:');
+  const unknown = createHandler(loaded.project, {
+    bindings: [{ name: 'STREAM_DO', class_name: 'Stream' }],
+    vars: { STREAM_SCHEMA: { fields: [{ name: 'kind', type: 'string', required: true, extra: true }] } },
+  }, { transport: unknownHost });
+  await assert.rejects(unknown.init(), /unknown schema field key.*extra/i);
+  const unknownTop = createHandler(loaded.project, {
+    bindings: [{ name: 'STREAM_DO', class_name: 'Stream' }],
+    vars: { STREAM_SCHEMA: { version: 1, fields: [{ name: 'kind', type: 'string', required: true }] } },
+  }, { transport: unknownHost });
+  await assert.rejects(unknownTop.init(), /unknown schema field key.*version/i);
+  unknownHost.close();
+});
+
+test('structured validation enforces hard field and record ceilings', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-schema-limits-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const handler = await makeHandler(loaded.project, host, { STREAM_SCHEMA: STRUCTURED_SCHEMA });
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  const tooManyFields = { kind: 'ok' };
+  for (let index = 0; index < 65; index += 1) tooManyFields[`field_${index}`] = index;
+  const huge = { kind: 'ok', count: 1, tags: ['x'.repeat(1024 * 1024)] };
+  const appended = await append(handler, [tooManyFields, huge]);
+  assert.equal(appended.status, 200);
+  assert.deepEqual(await body(appended), {
+    accepted: 2,
+    invalid: 2,
+    sequences: [1, 2],
+    errors: [
+      { index: 0, family: 'field_limit' },
+      { index: 1, family: 'record_limit' },
+    ],
+  });
+  const rows = await readRecords(handler, 0, 10);
+  assert.deepEqual(rows.body.records, []);
+  assert.equal(rows.body.next_after, 2);
+  assert.deepEqual(rows.body.skipped, [
+    { sequence: 1, family: 'field_limit' },
+    { sequence: 2, family: 'record_limit' },
+  ]);
+});
+
+test('the encoded request ceiling remains hard at 5 MiB', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-request-limit-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const handler = await makeHandler(loaded.project, host, { STREAM_SCHEMA: STRUCTURED_SCHEMA });
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  const rejected = await append(handler, [{ kind: 'oversized', payload: 'x'.repeat(5 * 1024 * 1024) }]);
+  assert.equal(rejected.status, 413);
+  assert.deepEqual((await readRecords(handler, 0, 10)).body.records, []);
+  const observed = await metrics(handler);
+  assert.equal(observed.body.user_errors.request_limit, 1);
+});
+
+test('malformed JSON increments its documented decode family', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-schema-decode-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const handler = await makeHandler(loaded.project, host, { STREAM_SCHEMA: STRUCTURED_SCHEMA });
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  const rejected = await handler.fetch(request('POST', 'https://verglas.internal/stream/append', '{'));
+  assert.equal(rejected.status, 400);
+  const observed = await metrics(handler);
+  assert.equal(observed.body.decode_errors, 1);
+  assert.equal(observed.body.user_errors.invalid_json, 1);
+});
+
 test('Stream source has no disallowed integration imports or bindings', async (t) => {
-  const files = ['worker.js', 'wrangler.jsonc'];
+  const files = ['worker.js', 'schema.js', 'wrangler.jsonc'];
   const source = (await Promise.all(files.map((file) => readFile(join(root, file), 'utf8')))).join('\n');
   const forbidden = ['ice' + 'berg', 's' + 'ink', 'cata' + 'log', 'off' + 'load', 'r' + '2', 'object-' + 'store'];
   for (const term of forbidden) assert.doesNotMatch(source, new RegExp(`(?:^|[^a-z])${term}(?:$|[^a-z])`, 'iu'));

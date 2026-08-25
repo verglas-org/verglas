@@ -11,6 +11,12 @@
     { "tag": "v1", "new_sqlite_classes": ["Stream"] }
   ],
   "vars": {
-    "STREAM_NAME": "main"
+    "STREAM_NAME": "main",
+    "STREAM_SCHEMA": {
+      "fields": [
+        { "name": "kind", "type": "string", "required": true },
+        { "name": "payload", "type": "json", "required": false }
+      ]
+    }
   }
 }
