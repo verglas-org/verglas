@@ -678,10 +678,14 @@ fn json_column(field: &Field, values: &[Option<&Value>]) -> CommitResult<ArrayRe
             .iter()
             .map(|value| {
                 value.map_or(Ok(None), |value| {
-                    value
-                        .as_bool()
-                        .ok_or_else(|| bad_request("Sink boolean value is invalid"))
-                        .map(Some)
+                    if value.is_null() {
+                        Ok(None)
+                    } else {
+                        value
+                            .as_bool()
+                            .ok_or_else(|| bad_request("Sink boolean value is invalid"))
+                            .map(Some)
+                    }
                 })
             })
             .collect::<Result<Vec<_>, _>>()
@@ -690,10 +694,14 @@ fn json_column(field: &Field, values: &[Option<&Value>]) -> CommitResult<ArrayRe
             .iter()
             .map(|value| {
                 value.map_or(Ok(None), |value| {
-                    value
-                        .as_i64()
-                        .ok_or_else(|| bad_request("Sink integer value is invalid"))
-                        .map(Some)
+                    if value.is_null() {
+                        Ok(None)
+                    } else {
+                        value
+                            .as_i64()
+                            .ok_or_else(|| bad_request("Sink integer value is invalid"))
+                            .map(Some)
+                    }
                 })
             })
             .collect::<Result<Vec<_>, _>>()
@@ -702,11 +710,15 @@ fn json_column(field: &Field, values: &[Option<&Value>]) -> CommitResult<ArrayRe
             .iter()
             .map(|value| {
                 value.map_or(Ok(None), |value| {
-                    value
-                        .as_f64()
-                        .or_else(|| value.as_i64().map(|integer| integer as f64))
-                        .ok_or_else(|| bad_request("Sink float value is invalid"))
-                        .map(Some)
+                    if value.is_null() {
+                        Ok(None)
+                    } else {
+                        value
+                            .as_f64()
+                            .or_else(|| value.as_i64().map(|integer| integer as f64))
+                            .ok_or_else(|| bad_request("Sink float value is invalid"))
+                            .map(Some)
+                    }
                 })
             })
             .collect::<Result<Vec<_>, _>>()
@@ -715,11 +727,15 @@ fn json_column(field: &Field, values: &[Option<&Value>]) -> CommitResult<ArrayRe
             .iter()
             .map(|value| {
                 value.map_or(Ok(None), |value| {
-                    value
-                        .as_str()
-                        .ok_or_else(|| bad_request("Sink string value is invalid"))
-                        .map(ToOwned::to_owned)
-                        .map(Some)
+                    if value.is_null() {
+                        Ok(None)
+                    } else {
+                        value
+                            .as_str()
+                            .ok_or_else(|| bad_request("Sink string value is invalid"))
+                            .map(ToOwned::to_owned)
+                            .map(Some)
+                    }
                 })
             })
             .collect::<Result<Vec<_>, _>>()

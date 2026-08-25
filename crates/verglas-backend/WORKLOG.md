@@ -157,3 +157,4 @@
 - #core-cleanup: Moved the small bucket glob matcher into the backend crate before
   deleting the unused core glob module. Bucket-set matching remains exact and
   allocation-bounded without retaining cache-node configuration helpers.
+- #171: Corrected public backend documentation links so strict workspace rustdoc resolves only public items and the owning factory method. Runtime behavior is unchanged.

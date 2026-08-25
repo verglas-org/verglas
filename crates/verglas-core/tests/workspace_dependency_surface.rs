@@ -78,17 +78,17 @@ fn collect_workspace_references(value: &toml::Value, references: &mut BTreeSet<S
     };
 
     for (key, child) in table {
-        if is_dependency_section(key) {
-            if let Some(dependencies) = child.as_table() {
-                for (name, specification) in dependencies {
-                    if specification
-                        .as_table()
-                        .and_then(|table| table.get("workspace"))
-                        .and_then(toml::Value::as_bool)
-                        == Some(true)
-                    {
-                        references.insert(name.clone());
-                    }
+        if is_dependency_section(key)
+            && let Some(dependencies) = child.as_table()
+        {
+            for (name, specification) in dependencies {
+                if specification
+                    .as_table()
+                    .and_then(|table| table.get("workspace"))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+                {
+                    references.insert(name.clone());
                 }
             }
         }

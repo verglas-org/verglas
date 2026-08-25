@@ -38,7 +38,19 @@ fn create_table_request(warehouse: &str) -> Request {
 
 /// Builds a Sink proposal operation with the supplied current metadata location.
 fn sink_request(current_metadata_location: Option<&str>) -> Request {
-    let batch_id = "batch-runtime";
+    sink_request_with_records(
+        current_metadata_location,
+        "batch-runtime",
+        json!([{"id": 1}, {"id": 2}]),
+    )
+}
+
+/// Builds a Sink proposal with explicit records and deterministic batch identity.
+fn sink_request_with_records(
+    current_metadata_location: Option<&str>,
+    batch_id: &str,
+    records: Value,
+) -> Request {
     let file_id = deterministic_sink_file_id("primary", batch_id);
     let sql_digest = "a".repeat(64);
     let body = json!({
@@ -60,7 +72,7 @@ fn sink_request(current_metadata_location: Option<&str>) -> Request {
             "compression": "zstd",
             "roll_interval_seconds": 60,
             "roll_size_bytes": 1024,
-            "records": [{"id": 1}, {"id": 2}]
+            "records": records
         }
     });
     Request {
@@ -579,5 +591,78 @@ async fn table_commit_preserves_exact_request_json_i64_values() -> Result<(), Bo
     assert_eq!(response.status, 200);
     let value: Value = serde_json::from_slice(&response.body)?;
     assert_ne!(value["metadata-location"].as_str(), Some(current));
+    Ok(())
+}
+
+/// Sink conversion supports every admitted primitive and rejects schema drift before writes.
+#[tokio::test]
+async fn sink_rows_cover_primitive_schema_and_fail_closed_drift() -> Result<(), Box<dyn Error>> {
+    let warehouse = tempfile::tempdir()?;
+    let service = local_service(warehouse.path())?;
+    let records = json!([
+        {"active": true, "id": 1, "score": 1.5, "name": "first", "optional": null},
+        {"active": false, "id": 2, "score": 2, "name": "second", "optional": "set"}
+    ]);
+    let response = service
+        .commit(sink_request_with_records(None, "primitive-types", records))
+        .await?;
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let proposal: Value = serde_json::from_slice(&response.body)?;
+    let current = proposal["metadata_location"]
+        .as_str()
+        .ok_or("metadata location")?;
+
+    for (batch, records) in [
+        (
+            "bad-bool",
+            json!([{"active": "yes", "id": 3, "score": 3.0, "name": "x"}]),
+        ),
+        (
+            "bad-int",
+            json!([{"active": true, "id": false, "score": 3.0, "name": "x"}]),
+        ),
+        (
+            "bad-float",
+            json!([{"active": true, "id": 3, "score": "high", "name": "x"}]),
+        ),
+        (
+            "bad-string",
+            json!([{"active": true, "id": 3, "score": 3.0, "name": 4}]),
+        ),
+        (
+            "unknown",
+            json!([{"active": true, "id": 3, "score": 3.0, "name": "x", "extra": 1}]),
+        ),
+        (
+            "missing",
+            json!([{"active": true, "score": 3.0, "name": "x"}]),
+        ),
+        ("not-object", json!([1, 2])),
+    ] {
+        let response = service
+            .commit(sink_request_with_records(Some(current), batch, records))
+            .await?;
+        assert_eq!(response.status, 400, "accepted invalid batch {batch}");
+    }
+
+    for (batch, records) in [
+        ("nested-array", json!([{"nested": [1]}])),
+        ("nested-object", json!([{"nested": {"value": 1}}])),
+        ("empty-object", json!([{}])),
+        ("type-change", json!([{"mixed": 1}, {"mixed": "one"}])),
+    ] {
+        let response = service
+            .commit(sink_request_with_records(None, batch, records))
+            .await?;
+        assert_eq!(
+            response.status, 400,
+            "accepted invalid inferred batch {batch}"
+        );
+    }
     Ok(())
 }

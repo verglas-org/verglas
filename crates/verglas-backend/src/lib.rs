@@ -358,7 +358,7 @@ struct BucketClients {
 type ClientBuilder = Box<dyn Fn(&str) -> Result<BucketClients, BackendError> + Send + Sync>;
 
 /// The backend store. Serves a [`BucketSet`], building each served bucket's
-/// [`BucketClients`] lazily on first request and memoizing them. A request for a
+/// internal clients lazily on first request and memoizing them. A request for a
 /// bucket outside the set is rejected with [`BackendError::NoSuchBucket`]; the
 /// server never builds a client for a bucket it does not serve.
 pub struct BackendStore {
@@ -510,7 +510,7 @@ impl BackendStore {
     }
 
     /// A single-bucket store whose typed store comes from `factory`, called once
-    /// on first request for `bucket`. Convenience over [`with_glob_factory`] for
+    /// on first request for `bucket`. Convenience over [`Self::with_glob_factory`] for
     /// tests that serve exactly one bucket. A build failure propagates.
     pub fn with_factory<F>(
         storage_binding_id: impl Into<String>,

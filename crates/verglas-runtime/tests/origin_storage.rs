@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream;
 use iceberg::io::{FileRead, Storage, StorageConfig, StorageFactory};
 use object_store::memory::InMemory;
 use object_store::path::Path;
@@ -259,6 +260,9 @@ async fn object_locations_reject_ambiguous_path_segments() -> Result<(), Box<dyn
     let storage = factory.build(&StorageConfig::new())?;
 
     for location in [
+        "relative/key",
+        "s3://lake",
+        "s3://lake/",
         "s3://lake/table/../escape",
         "s3://lake/table/./data",
         "s3://lake/table//data",
@@ -272,5 +276,124 @@ async fn object_locations_reject_ambiguous_path_segments() -> Result<(), Box<dyn
             "ambiguous location was accepted: {location:?}"
         );
     }
+    Ok(())
+}
+
+/// The complete Iceberg storage surface preserves immutable writes and exact deletion fences.
+#[tokio::test]
+async fn storage_surface_is_fail_closed_and_immutable() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let origin = Arc::new(InMemory::new());
+    origin_put(&origin, "table/existing.bin", b"existing").await;
+    let config = OriginStorageConfig::new("managed", "lake", cache_config(&directory));
+    assert_eq!(config.storage_binding_id(), "managed");
+    assert_eq!(config.bucket(), "lake");
+    assert_eq!(config.scheme(), "s3");
+    assert_eq!(config.cache().dir, directory.path());
+    let factory =
+        OriginStorageFactory::new(backend("managed", "lake", Arc::clone(&origin)), config).await?;
+    assert!(format!("{factory:?}").contains("managed"));
+    let serialized_factory = serde_json::to_string(&factory)?;
+    assert!(serde_json::from_str::<OriginStorageFactory>(&serialized_factory).is_err());
+    let storage = factory.build(&StorageConfig::new())?;
+
+    assert!(storage.exists("s3://lake/table/existing.bin").await?);
+    assert!(!storage.exists("s3://lake/table/missing.bin").await?);
+    assert_eq!(
+        storage.metadata("s3://lake/table/existing.bin").await?.size,
+        8
+    );
+    let reader = storage.reader("s3://lake/table/existing.bin").await?;
+    let reversed_start = 5;
+    let reversed_end = 4;
+    assert!(reader.read(reversed_start..reversed_end).await.is_err());
+    assert!(reader.read(4..4).await?.is_empty());
+
+    let streamed = "s3://lake/table/streamed.bin";
+    let mut writer = storage.writer(streamed).await?;
+    writer.write(Bytes::from_static(b"stream")).await?;
+    writer.write(Bytes::from_static(b"ed")).await?;
+    writer.close().await?;
+    assert!(writer.write(Bytes::from_static(b"late")).await.is_err());
+    assert!(writer.close().await.is_err());
+    assert_eq!(
+        storage.read(streamed).await?,
+        Bytes::from_static(b"streamed")
+    );
+
+    let existing = "s3://lake/table/existing.bin";
+    let mut short_retry = storage.writer(existing).await?;
+    short_retry.write(Bytes::from_static(b"exist")).await?;
+    assert!(short_retry.close().await.is_err());
+    assert!(short_retry.close().await.is_err());
+    let mut changed_retry = storage.writer(existing).await?;
+    assert!(
+        changed_retry
+            .write(Bytes::from_static(b"different"))
+            .await
+            .is_err()
+    );
+    assert!(
+        changed_retry
+            .write(Bytes::from_static(b"late"))
+            .await
+            .is_err()
+    );
+    let mut long_retry = storage.writer(existing).await?;
+    assert!(
+        long_retry
+            .write(Bytes::from_static(b"existing-extra"))
+            .await
+            .is_err()
+    );
+
+    let abandoned = "s3://lake/table/abandoned.bin";
+    drop(storage.writer(abandoned).await?);
+    tokio::task::yield_now().await;
+    assert!(!storage.exists(abandoned).await?);
+    assert!(storage.delete_prefix("s3://lake/table").await.is_err());
+    storage
+        .delete_stream(Box::pin(stream::iter([
+            existing.to_owned(),
+            streamed.to_owned(),
+        ])))
+        .await?;
+    assert!(!storage.exists(existing).await?);
+    assert!(!storage.exists(streamed).await?);
+
+    let serialized = serde_json::to_string(storage.as_ref())?;
+    assert!(!serialized.contains("managed"));
+    assert!(serde_json::from_str::<Box<dyn Storage>>(&serialized).is_err());
+    Ok(())
+}
+
+/// Invalid routes and cache budgets fail during factory construction without fallback storage.
+#[tokio::test]
+async fn factory_rejects_invalid_route_and_budget_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let origin = Arc::new(InMemory::new());
+    let stores = backend("managed", "lake", origin);
+    for config in [
+        OriginStorageConfig::new("", "lake", cache_config(&directory)),
+        OriginStorageConfig::new("managed", "bad/bucket", cache_config(&directory)),
+        OriginStorageConfig::new("managed", "lake", cache_config(&directory)).with_scheme("memory"),
+    ] {
+        assert!(
+            OriginStorageFactory::new(Arc::clone(&stores), config)
+                .await
+                .is_err()
+        );
+    }
+    let mut undersized = cache_config(&directory);
+    undersized.dram_bytes = ByteSize(1);
+    assert!(
+        OriginStorageFactory::new(
+            stores,
+            OriginStorageConfig::new("managed", "lake", undersized),
+        )
+        .await
+        .is_err()
+    );
     Ok(())
 }

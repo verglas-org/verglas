@@ -50,10 +50,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
       - uses: actions/setup-node@v4
         with:
@@ -77,8 +77,8 @@ jobs:
   coverage:
     # The floor ratchets upward: when a PR raises overall coverage, it must
     # also raise this number to just below the new value (see AGENTS.md,
-    # "Coverage"). Long-term target: >=90 lines; measured baseline 28.96%
-    # (2026-08-16).
+    # "Coverage"). Long-term target: >=90 lines; the all-feature workspace
+    # measurement is 77.20% (2026-08-25).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +91,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
 
       - name: Coverage summary
         if: always()
@@ -104,12 +104,9 @@ jobs:
           name: coverage-lcov
           path: lcov.info
 
-      # Measured baseline on 2026-08-16 was 28.96% workspace line coverage —
-      # the old 88 floor predated the consolidation and was never enforced on
-      # PRs. The ratchet applies from the measured number upward.
-      # 2026-08-23 (#171): the DO engine/runtime landed a large new workspace
-      # surface and the measured total is 59.40% lines (identical locally and
-      # on CI), so the floor resets just below that value. The ratchet resumes
-      # upward from here.
+      # 2026-08-25 (#171): all-feature workspace coverage is 77.20% lines after
+      # the six-product runtime, immutable origin, and Catalog proposal paths
+      # gained behavioral coverage. Keep the enforced integer just below that
+      # measured value and ratchet it upward with future increases.
       - name: Enforce the floor
-        run: cargo llvm-cov report --fail-under-lines 59
+        run: cargo llvm-cov report --fail-under-lines 77

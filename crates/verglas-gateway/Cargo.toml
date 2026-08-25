@@ -33,6 +33,11 @@ name = "verglas-runtime-test-support"
 path = "src/bin/verglas-runtime-test-support.rs"
 required-features = ["ac1-test-support"]
 
+[[test]]
+name = "ac1_integration"
+path = "tests/ac1_integration.rs"
+required-features = ["ac1-test-support"]
+
 [dev-dependencies]
 reqwest.workspace = true
 tempfile.workspace = true

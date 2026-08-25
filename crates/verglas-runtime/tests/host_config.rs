@@ -67,9 +67,14 @@ fn parses_complete_catalog_host_configuration() -> Result<(), Box<dyn std::error
     let directory = tempfile::tempdir()?;
     let config: CatalogHostConfig = serde_json::from_value(document(directory.path()))?;
     config.validate()?;
+    assert_eq!(config.origin().storage_binding_id(), "catalog-origin");
     assert_eq!(config.origin().bucket(), "lake");
     assert_eq!(config.origin().scheme(), "s3");
+    assert_eq!(config.cache().dir, directory.path());
     assert_eq!(config.warehouse(), "s3://lake/warehouse");
+    assert_eq!(config.sink().sink_id(), "primary");
+    assert_eq!(config.sink().namespace(), "analytics");
+    assert_eq!(config.sink().table(), "events");
     assert_eq!(config.sink().compression().as_str(), "zstd");
     Ok(())
 }
@@ -164,6 +169,58 @@ fn rejects_local_origin_scheme() -> Result<(), Box<dyn std::error::Error>> {
     let config: CatalogHostConfig = serde_json::from_value(value)?;
     let error = config.validate().expect_err("local scheme");
     assert!(error.to_string().contains("local and in-memory"));
+    Ok(())
+}
+
+/// A valid operator file loads every supported compression spelling strictly.
+#[test]
+fn loads_valid_file_and_all_compression_fences() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    for compression in ["zstd", "snappy", "gzip", "lz4", "uncompressed"] {
+        let mut value = document(directory.path());
+        value["sink"]["compression"] = Value::String(compression.to_owned());
+        let path = directory.path().join(format!("catalog-{compression}.json"));
+        std::fs::write(&path, serde_json::to_vec(&value)?)?;
+        assert_eq!(
+            CatalogHostConfig::load(&path)?
+                .sink()
+                .compression()
+                .as_str(),
+            compression
+        );
+    }
+    let mut invalid = document(directory.path());
+    invalid["sink"]["compression"] = Value::String("brotli".to_owned());
+    assert!(serde_json::from_value::<CatalogHostConfig>(invalid).is_err());
+    Ok(())
+}
+
+/// Invalid identity and cache budgets fail before any backend construction.
+#[test]
+fn rejects_invalid_identity_and_cache_budgets() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    for (pointer, invalid) in [
+        ("/origin/storage_binding_id", "bad binding"),
+        ("/origin/bucket", "bad/bucket"),
+        ("/origin/scheme", "bad:scheme"),
+        ("/sink/sink_id", "bad id"),
+        ("/sink/namespace", "analytics..private"),
+        ("/sink/table", "bad/table"),
+    ] {
+        let mut value = document(directory.path());
+        *value.pointer_mut(pointer).ok_or("fixture pointer")? = Value::String(invalid.to_owned());
+        let config: CatalogHostConfig = serde_json::from_value(value)?;
+        assert!(config.validate().is_err(), "accepted {pointer}={invalid:?}");
+    }
+    for (pointer, bytes) in [
+        ("/cache/dram_bytes", "1B"),
+        ("/cache/capacity_bytes", "1MB"),
+    ] {
+        let mut value = document(directory.path());
+        *value.pointer_mut(pointer).ok_or("fixture pointer")? = Value::String(bytes.to_owned());
+        let config: CatalogHostConfig = serde_json::from_value(value)?;
+        assert!(config.validate().is_err(), "accepted {pointer}={bytes}");
+    }
     Ok(())
 }
 
