@@ -246,7 +246,7 @@ test('Worker endpoint fails closed for configured auth and emits configured CORS
   assert.equal((await readRecords(handler, 0, 10)).body.records.length, 1);
 });
 
-test('structured schemas preserve invalid ingestion and drop them from processing reads', async (t) => {
+test('processing skips invalid records without renumbering durable Stream sequence', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-schema-'));
   const path = join(directory, 'stream.sqlite');
   const loaded = await loadProject();
