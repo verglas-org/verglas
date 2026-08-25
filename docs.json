@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "maple",
   "name": "Verglas documentation",
-  "description": "Run the lakehouse runtime on a self-hosted Verglas server.",
+  "description": "Run Worker and Durable Object WASM products on the Verglas edge runtime.",
   "colors": {
     "primary": "#2563EB",
     "light": "#60A5FA",

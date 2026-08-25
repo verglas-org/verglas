@@ -193,3 +193,22 @@ fn whitepaper_has_no_clustered_runtime_architecture() -> Result<(), Box<dyn std:
     }
     Ok(())
 }
+
+/// Unreferenced legacy API specifications cannot advertise retired products as active surfaces.
+#[test]
+fn docs_have_no_retired_standalone_api_surfaces() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root();
+    for retired in [
+        "docs/reference/openapi/management-open-api.yaml",
+        "docs/reference/openapi/generic-table-open-api.yaml",
+        "docs/reference/openapi/query-open-api.yaml",
+    ] {
+        assert!(
+            !root.join(retired).exists(),
+            "retired API remains: {retired}"
+        );
+    }
+    let docs_config = fs::read_to_string(root.join("docs.json"))?;
+    assert!(!docs_config.contains("self-hosted Verglas server"));
+    Ok(())
+}
