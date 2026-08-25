@@ -19,7 +19,7 @@ use crate::artifact::{ArtifactError, ComponentDigest, CwasmCache};
 use crate::gate::{EventGate, EventPermit};
 
 /// Request record accepted by the Worker `fetch` export.
-pub use bindings::verglas::do_worker::types::{Request, Response};
+pub use crate::abi::{Request, Response};
 
 /// Errors raised while compiling, instantiating, or invoking a Worker.
 #[derive(Debug, Error)]
