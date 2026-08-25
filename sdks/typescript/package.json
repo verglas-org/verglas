@@ -9,17 +9,13 @@
     "directory": "sdks/typescript"
   },
   "type": "module",
-  "description": "Dependency-free TypeScript SDK for Verglas catalog, cache, and semantic clients. Runs in fetch-capable runtimes and Node 18+.",
+  "description": "Dependency-free TypeScript SDK for Verglas Catalog and Worker management. Runs in fetch-capable runtimes and Node 18+.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    },
-    "./data": {
-      "types": "./dist/data.d.ts",
-      "default": "./dist/data.js"
     },
     "./logging": {
       "types": "./dist/logging.d.ts",
@@ -30,7 +26,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "build": "tsup --entry.index src/index.ts --entry.data src/data.ts --entry.logging src/logging.ts --format esm --dts --out-dir dist --clean",
+    "build": "tsup --entry.index src/index.ts --entry.logging src/logging.ts --format esm --dts --out-dir dist --clean",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

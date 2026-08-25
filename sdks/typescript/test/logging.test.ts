@@ -4,10 +4,8 @@ import {
   errorMessage,
   inferPlacement,
   isLogsTable,
-  logsCharting,
   logsTableName,
   newRunId,
-  observabilityFor,
   RunLogger,
 } from "../src/logging";
 import { startMockEndpoint, type MockEndpoint } from "./mock-endpoint";
@@ -31,8 +29,8 @@ describe("logging primitives", () => {
   });
 
   it("generates run IDs and classifies endpoint placement", () => {
-    expect(newRunId()).toMatch(/^run-|^[0-9a-f-]{36}$/);
-    expect(inferPlacement("http://127.0.0.1:8334")).toBe("local");
+    expect(newRunId()).toMatch(/^[0-9a-f-]{36}$/);
+    expect(inferPlacement("http://localhost")).toBe("local");
     expect(inferPlacement("https://api.example.test")).toBe("remote");
   });
 
@@ -88,30 +86,5 @@ describe("logging primitives", () => {
 
     await expect(logger.flush(broken)).resolves.toBeUndefined();
     expect(warnings).toHaveLength(1);
-  });
-});
-
-describe("chart declarations", () => {
-  it("declares the standard chart over a logs table", () => {
-    const charting = logsCharting("app.points");
-    expect(charting.source).toBe("app.points_LOGS");
-    expect(charting.chart.input).toBe("app.points_LOGS");
-    expect(charting.chart.timeField).toBe("ts");
-    expect(charting.chart.dimensions).toEqual(["event", "kind"]);
-    expect(charting.chart.measures.map((measure) => measure.name)).toEqual([
-      "runs",
-      "errors",
-      "rows",
-      "duration_p50",
-      "duration_p95",
-      "duration_p99",
-    ]);
-  });
-
-  it("builds the deployment observability declaration", () => {
-    const observability = observabilityFor("app.points");
-    expect(observability.pipeline).toBe("app.points");
-    expect(observability.logsTable).toBe("app.points_LOGS");
-    expect(observability.charting.source).toBe("app.points_LOGS");
   });
 });

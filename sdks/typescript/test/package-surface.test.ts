@@ -32,8 +32,24 @@ const forbiddenFiles = [
   "examples/http-poll-worker.ts",
   "examples/webhook-worker.ts",
   "examples/change-fanout-worker.ts",
+  "data.ts",
+  "dashboards.ts",
+  "feed.ts",
+  "graph-handle.ts",
+  "namespace.ts",
+  "semantic.ts",
+  "semantic-types.ts",
 ];
-const forbiddenTests = ["control.test.ts", "endpoint-run.test.ts", "examples.test.ts"];
+const forbiddenTests = [
+  "control.test.ts",
+  "endpoint-run.test.ts",
+  "examples.test.ts",
+  "feed.test.ts",
+  "graph-handle.test.ts",
+  "namespace.test.ts",
+  "semantic.test.ts",
+  "v0-alignment.test.ts",
+];
 const forbiddenExports = [
   "DurableObject",
   "StorageBridge",
@@ -56,6 +72,53 @@ const forbiddenExports = [
   "CronTriggerSpec",
   "WebhookTriggerSpec",
   "EventTriggerSpec",
+  "S3VectorsClient",
+  "VerglasGraphsClient",
+  "Graph",
+  "graphFromEnv",
+  "GraphEdgeInput",
+  "GraphFromEnvOptions",
+  "GraphNodeInput",
+  "SemanticDocument",
+  "SigV4Credentials",
+  "createDataClient",
+  "DataClient",
+  "DataClientOptions",
+  "IngestResult",
+  "DynamicNamespaceRegistry",
+  "DynamicNamespaceNode",
+  "NamespaceBinding",
+  "NamespaceBindings",
+  "NamespaceCall",
+  "NamespaceJsonSchema",
+  "NamespaceManifest",
+  "NamespaceMethod",
+  "NamespaceMethodManifest",
+  "NamespaceMethodMode",
+  "NamespaceRegistry",
+  "ChangeEvent",
+  "ChangeHandler",
+  "FeedSubscription",
+  "FollowFeedOptions",
+  "FollowHandler",
+  "FollowRowsOptions",
+  "QueryAt",
+];
+const forbiddenSourceTokens = [
+  "DashboardSource",
+  "DashboardElement",
+  "DashboardSpec",
+  "DashboardDataClient",
+  "DashboardStateStore",
+  "bindDashboardSources",
+  "LogsChartAgg",
+  "LogsChartMeasure",
+  "LogsChartSpec",
+  "LogsCharting",
+  "standardLogsChartSpec",
+  "logsCharting",
+  "WorkerObservability",
+  "observabilityFor",
 ];
 const indexTokens = new Set(indexSource.split(/[^A-Za-z0-9_$]+/u).filter(Boolean));
 
@@ -83,15 +146,42 @@ describe("SDK package surface", () => {
     }
   });
 
+  it("does not publish retired semantic, data, reflection, feed, or dashboard surfaces", () => {
+    for (const name of forbiddenExports) expect(indexTokens.has(name)).toBe(false);
+    for (const name of forbiddenSourceTokens) expect(sourceText).not.toContain(name);
+    expect(packageJson.exports).not.toHaveProperty("./data");
+    expect(packageJson.scripts.build).not.toContain("entry.data");
+    for (const text of [
+      "S3VectorsClient",
+      "VerglasGraphsClient",
+      "graphFromEnv",
+      "createDataClient",
+      "DataClient",
+      "tableWrite",
+      "vectorWrite",
+      "client.reflect",
+      "client.follow",
+      "bindDashboardSources",
+      "DashboardSpec",
+    ]) {
+      expect(readmeSource).not.toContain(text);
+    }
+  });
+
   it("does not export or mention the deleted custom protocol", () => {
     for (const name of forbiddenExports) expect(indexTokens.has(name)).toBe(false);
     for (const word of forbiddenProtocolWords) expect(sourceText).not.toContain(word);
   });
 
-  it("keeps the catalog and semantic clients on the public root", async () => {
+  it("requires Web Crypto UUIDs instead of time/random fallbacks", () => {
+    expect(sourceText).not.toContain("Math.random");
+    expect(sourceText).not.toContain("Date.now");
+  });
+
+  it("keeps the catalog and Worker management clients on the public root", async () => {
     const sdk = await import("../src/index");
     expect(sdk.connect).toBeTypeOf("function");
-    expect(sdk.S3VectorsClient).toBeTypeOf("function");
-    expect(sdk.VerglasGraphsClient).toBeTypeOf("function");
+    expect(sdk.Table).toBeTypeOf("function");
+    expect(sdk.WorkersManagementClient).toBeTypeOf("function");
   });
 });

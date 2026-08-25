@@ -2,24 +2,13 @@
 
 import { makeTransport, type Transport } from "./http";
 import { VerglasHttpError } from "./http";
-import { CatalogFeed, feedUrl, globalWebSocket } from "./feed";
-import { NamespaceRuntime } from "./namespace";
 import type {
-  ChangeHandler,
   CommitOptions,
   CommitResult,
   ConnectOptions,
+  DeltaResult,
   CreateTableResult,
   EnsureTableResult,
-  DeltaResult,
-  FeedSubscription,
-  FollowFeedOptions,
-  FollowRowsOptions,
-  DynamicNamespaceRegistry,
-  NamespaceBindings,
-  NamespaceManifest,
-  NamespaceRegistry,
-  FollowHandler,
   Row,
   ScanOptions,
   ScanResult,
@@ -33,9 +22,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 /**
  * Opens a client against a Verglas endpoint (the self-hosted server's base URL).
  */
-export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceRegistry>(
-  opts: ConnectOptions,
-): VerglasClient<Namespaces> {
+export function connect(opts: ConnectOptions): VerglasClient {
   if (!opts.endpoint) throw new Error("connect: endpoint is required");
   if (!opts.token) throw new Error("connect: token is required");
   const fetchImpl = opts.fetch ?? globalThis.fetch;
@@ -43,153 +30,27 @@ export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceR
     throw new Error("connect: no global fetch; pass one via ConnectOptions.fetch");
   }
   const transport = makeTransport(opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  return new VerglasClient<Namespaces>(transport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return new VerglasClient(transport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 }
 
 /** A connected Verglas client. Cheap to hold; makes no requests until used. */
-export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespaceRegistry> {
-  /** The shared change-feed socket, opened lazily on the first `follow`. */
-  private feed?: CatalogFeed;
-  readonly #namespaces: NamespaceRuntime<Namespaces>;
+export class VerglasClient {
   /** Resolved Iceberg REST catalog base, discovered lazily when unset. */
   #catalogUri?: string;
   #catalogTransport?: Transport;
-
-  /** Integration APIs composed into this client through reflection. */
-  readonly namespace: NamespaceBindings<Namespaces>;
 
   /** @internal */
   constructor(
     private readonly transport: Transport,
     /** The endpoint this client is bound to (for logging/diagnostics). */
     readonly endpoint: string,
-    /** Bearer token, reused to authenticate the change-feed websocket. */
+    /** Bearer token used for catalog discovery and requests. */
     private readonly token: string,
     catalogUri: string | undefined,
     private readonly fetchImpl: typeof fetch,
     private readonly timeoutMs: number,
   ) {
-    this.#namespaces = new NamespaceRuntime<Namespaces>(transport);
-    this.namespace = this.#namespaces.namespace;
     this.#catalogUri = catalogUri;
-  }
-
-  /** Lists all Integration namespace manifests visible to this principal. */
-  reflect(): Promise<NamespaceManifest[]>;
-  /** Reads one Integration namespace manifest and caches it for later invocations. */
-  reflect(namespace: string): Promise<NamespaceManifest>;
-  reflect(namespace?: string): Promise<NamespaceManifest | NamespaceManifest[]> {
-    return namespace === undefined ? this.#namespaces.reflect() : this.#namespaces.manifest(namespace);
-  }
-
-
-  /**
-   * Follows table-commit notifications over the platform's edge change feed and
-   * invokes `handler` for each commit to the named table(s). One websocket per
-   * client carries every follow (multiplexed and filtered client-side), so this
-   * never opens a long-lived connection to a tenant backend — the backend scales
-   * to zero and the edge holds the socket while it sleeps.
-   *
-   * A `ChangeEvent` is a *notification* (seq, table, snapshot id, commit time),
-   * not the rows. To read what changed, `delta` the table from a watermark. Pass
-   * `opts.cursor` to replay past changes (an int seq) or omit it for live-only;
-   * pass `opts.onResync` to learn when the edge drops replay history and the feed
-   * falls back to live. Returns a handle — call `close()` (or abort
-   * `opts.signal`) to end this follow; the socket closes with the last one.
-   *
-   * This is distinct from `Table.follow`, which polls the backend for *rows*.
-   */
-  follow(table: string | string[], handler: ChangeHandler, opts?: FollowFeedOptions): FeedSubscription {
-    const tables = Array.isArray(table) ? table : [table];
-    if (tables.length === 0 || tables.some((t) => !t)) {
-      throw new Error("follow: at least one non-empty table name is required");
-    }
-    if (!this.feed) {
-      this.feed = new CatalogFeed(feedUrl(this.endpoint), this.token, globalWebSocket());
-    }
-    return this.feed.follow(tables, handler, opts);
-  }
-
-  /**
-   * Follows a table's ROWS, driven by the change feed instead of interval polling.
-   * Subscribes to the table's commit notifications (`follow` above) and, on each
-   * commit, delta-reads the newly committed rows and invokes
-   * `handler(newRows, watermark)`. This is the row subscription primitive workers
-   * and consumers use — a commit notification wakes a bounded `delta` read, so an
-   * idle table costs nothing (the edge holds the socket while the backend sleeps).
-   *
-   * Starts from `opts.fromWatermark`, or the table's current snapshot when omitted
-   * (only rows committed from here on are delivered). Batches are delivered in
-   * commit order and `handler` is awaited before the next drain, so a slow handler
-   * applies natural backpressure. If `handler` (or a delta read) throws and no
-   * `onError` is given, the subscription closes and `closed` rejects. Call
-   * `close()` (or abort `opts.signal`) to stop.
-   */
-  followRows<T extends Row = Row>(
-    table: string,
-    handler: FollowHandler<T>,
-    opts?: FollowRowsOptions,
-  ): FeedSubscription {
-    if (!table) throw new Error("followRows: a non-empty table name is required");
-    const handle = this.table<T>(table);
-
-    // The tracked position. When no starting watermark is given, capture the
-    // current snapshot EAGERLY (at call time, before any later commit lands), so
-    // we deliver exactly the rows committed from here on — not from first change.
-    let watermark: Watermark | undefined = opts?.fromWatermark;
-    const started: Promise<void> =
-      opts?.fromWatermark !== undefined
-        ? Promise.resolve()
-        : handle.snapshot().then((s) => void (watermark = s.watermark));
-
-    // Serialize drains so commits are processed one at a time, in order, with the
-    // handler awaited (backpressure). A pending drain coalesces further changes.
-    let draining: Promise<void> = Promise.resolve();
-    let closed = false;
-    let rejectClosed: ((err: unknown) => void) | undefined;
-
-    const drain = async (): Promise<void> => {
-      await started;
-      for (;;) {
-        if (closed) return;
-        const d: DeltaResult<T> = await handle.delta(watermark as Watermark, { limit: opts?.batchSize });
-        watermark = d.watermark;
-        if (d.rows.length === 0) return;
-        await handler(d.rows, d.watermark);
-      }
-    };
-
-    const onChange: ChangeHandler = () => {
-      draining = draining.then(drain).catch((err) => {
-        if (opts?.onError) {
-          opts.onError(err);
-          return;
-        }
-        closed = true;
-        sub.close();
-        rejectClosed?.(err);
-      });
-    };
-
-    const sub = this.follow(table, onChange, {
-      cursor: opts?.cursor,
-      onResync: opts?.onResync,
-      signal: opts?.signal,
-    });
-
-    // Wrap the feed subscription's `closed` so an unhandled error rejects it, the
-    // way the old row-poller's `done` promise rejected.
-    const closedPromise = new Promise<void>((resolve, reject) => {
-      rejectClosed = reject;
-      sub.closed.then(resolve, reject);
-    });
-    return {
-      close: () => {
-        closed = true;
-        sub.close();
-      },
-      closed: closedPromise,
-    };
   }
 
   /** A handle to one table by fully-qualified name (e.g. `demo.job_runs`). */
@@ -198,14 +59,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     return new Table<T>(this.transport, name);
   }
 
-  /**
-   * Creates a table from an explicit schema and partition spec. Use this when the
-   * table needs exact column types (decimals, dates), per-column nullability, or
-   * a partition spec (month transform, several columns) that the schema inference
-   * on the first commit cannot express. The SDK does not build the table in JS —
-   * it POSTs the definition to the endpoint, which owns the catalog. Returns the
-   * table name and its final column list.
-   */
   /**
    * Creates a table in the Iceberg REST catalog from an explicit schema and
    * partition spec. Prefer `ensureTable` when the table may already exist.
@@ -278,7 +131,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     });
   }
 
-  /** Executes SQL through the configured database query endpoint. */
 }
 
 

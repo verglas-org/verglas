@@ -1,8 +1,7 @@
 // Standardized worker logging + observability for the Verglas SDK runtime.
 //
 // Callers can emit structured run logs to a standard `<name>_LOGS` table with a
-// fixed shape, batch rows into one append, and key a retry by run ID. This module
-// also defines the charting spec attached over each `<name>_LOGS` table.
+// fixed shape, batch rows into one append, and key a retry by run ID.
 //
 // Framework-neutral: nothing here knows about any specific domain. It is generic
 // over any worker and any table.
@@ -34,7 +33,7 @@ export type LogLevel = "info" | "warn" | "error";
 
 /**
  * The standardized log row. EVERY pipeline's logs share this exact shape, so a
- * single charting sink works over any `<name>_LOGS` table.
+ * one log consumer can process any `<name>_LOGS` table.
  *
  * `ts` is epoch nanoseconds as a string (kept as a string to avoid float loss).
  * `day` (YYYY-MM-DD) is the partition column, derived from `ts`.
@@ -82,11 +81,22 @@ function msToDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
-/** Generates a run id. Uses crypto.randomUUID where available. */
+/** Reads epoch milliseconds from the runtime's required monotonic clock. */
+function runtimeNow(): number {
+  const clock = globalThis.performance;
+  if (!clock || typeof clock.timeOrigin !== "number") {
+    throw new Error("RunLogger: performance.timeOrigin is required when now is omitted");
+  }
+  return clock.timeOrigin + clock.now();
+}
+
+/** Generates a run id using the required Web Crypto UUID primitive. */
 export function newRunId(): string {
-  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
-  if (c?.randomUUID) return c.randomUUID();
-  return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (typeof randomUUID !== "function") {
+    throw new Error("newRunId: crypto.randomUUID is required");
+  }
+  return randomUUID.call(globalThis.crypto);
 }
 
 /** Loopback endpoints are local; anything else is remote. */
@@ -114,8 +124,8 @@ export interface RunLoggerOptions {
    *  name. Identifies who produced the run, and prefixes emit idempotency keys. */
   pipeline: string;
   /** The table whose `_LOGS` sibling receives this run's logs. The logs table is
-   *  `<logsTarget>_LOGS` — the deployment's TARGET table, so a dashboard reads
-   *  one logs table per target even when several deployments share it. Defaults
+   *  `<logsTarget>_LOGS` — the deployment's TARGET table, so consumers read one
+   *  logs table per target even when several deployments share it. Defaults
    *  to `pipeline`: on the direct local path the label and the table coincide, so
    *  `<name>_LOGS` is unchanged. Decoupled from `pipeline` so the two concerns —
    *  which table the logs land in vs. which name they carry — thread separately. */
@@ -124,7 +134,7 @@ export interface RunLoggerOptions {
   placement: LogPlacement;
   /** Reuse across a retry to keep the log commit idempotent. */
   runId?: string;
-  /** Injectable millisecond clock (tests). Defaults to Date.now. */
+  /** Injectable epoch-millisecond clock (tests). Defaults to performance. */
   now?: () => number;
   /** Where best-effort warnings go when a log write fails. Defaults to console. */
   warn?: (message: string, err?: unknown) => void;
@@ -153,7 +163,7 @@ export class RunLogger {
     // The logs table follows the target, not the pipeline label; they coincide
     // only when logsTarget is omitted (the direct local path).
     this.logsTable = logsTableName(opts.logsTarget ?? opts.pipeline);
-    this.clock = opts.now ?? Date.now;
+    this.clock = opts.now ?? runtimeNow;
     this.warn = opts.warn ?? ((m, e) => console.warn(m, e));
   }
 
@@ -275,105 +285,4 @@ function instrumentTable<T extends Row>(table: Table<T>, logger: RunLogger, name
       return Reflect.get(target, prop, receiver);
     },
   });
-}
-
-// ---------------------------------------------------------------------------
-// Automatic charting spec over <name>_LOGS
-// ---------------------------------------------------------------------------
-
-export type LogsChartAgg = "sum" | "count" | "rate" | "p50" | "p95" | "p99";
-
-export interface LogsChartMeasure {
-  /** Output series name. */
-  name: string;
-  agg: LogsChartAgg;
-  /** Column the aggregate reads (omitted for a plain row count). */
-  field?: string;
-  /** For `rate`: the field value counted as the numerator (e.g. "error"). */
-  match?: string;
-}
-
-/** The standardized chart spec a renderer consumes to draw the logs dashboard. */
-export interface LogsChartSpec {
-  /** The `<name>_LOGS` table this dashboard reads. */
-  input: string;
-  /** Time axis column. */
-  timeField: "ts";
-  /** Group-by dimensions. */
-  dimensions: readonly string[];
-  /** Standard measures: run rate, error rate, rows, latency percentiles. */
-  measures: readonly LogsChartMeasure[];
-}
-
-/** A declaration carrying the standard chart spec over a logs table. Not a
- *  worker — a pure declaration a renderer consumes to draw the dashboard. */
-export interface LogsCharting {
-  /** The `<name>_LOGS` table this dashboard reads. */
-  readonly source: string;
-  /** The standardized dashboard definition for this logs table. */
-  readonly chart: LogsChartSpec;
-}
-
-/** The fixed set of measures/dimensions every logs dashboard reports. */
-export function standardLogsChartSpec(logsTable: string): LogsChartSpec {
-  return {
-    input: logsTable,
-    timeField: "ts",
-    dimensions: ["event", "kind"],
-    measures: [
-      { name: "runs", agg: "count" },
-      { name: "errors", agg: "rate", field: "level", match: "error" },
-      { name: "rows", agg: "sum", field: "rows" },
-      { name: "duration_p50", agg: "p50", field: "duration_ms" },
-      { name: "duration_p95", agg: "p95", field: "duration_ms" },
-      { name: "duration_p99", agg: "p99", field: "duration_ms" },
-    ],
-  };
-}
-
-/**
- * Declares the standard charting/observability over a worker's `<name>_LOGS`
- * table: run rates, error counts, rows over time, and latency percentiles,
- * grouped by `event` and `kind`.
- *
- * A pure declaration — its `chart` spec is what a renderer consumes. RENDERER
- * (flagged): this SDK does not draw charts. The chart RENDERER is the missing
- * consumer that reads `<name>_LOGS` per `chart` and produces the visuals.
- */
-export function logsCharting(pipeline: string): LogsCharting {
-  const input = logsTableName(pipeline);
-  return {
-    source: input,
-    chart: standardLogsChartSpec(input),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Deployment hook
-// ---------------------------------------------------------------------------
-
-/** Everything the deploy path needs to wire up observability for a worker. */
-export interface WorkerObservability {
-  pipeline: string;
-  /** `<name>_LOGS`. */
-  logsTable: string;
-  /** The charting declaration to attach alongside the worker, automatically. */
-  charting: LogsCharting;
-}
-
-/**
- * The deployment hook. When a worker is registered/deployed, call this to learn
- * its logs table and default charting declaration, so every worker gets
- * observability with no per-worker wiring.
- *
- * Log retention is not the SDK's concern: every `<name>_LOGS` table is pruned to
- * the platform's standard TTL by the server's housekeeping, not by anything
- * computed here.
- */
-export function observabilityFor(name: string): WorkerObservability {
-  return {
-    pipeline: name,
-    logsTable: logsTableName(name),
-    charting: logsCharting(name),
-  };
 }

@@ -6,27 +6,8 @@
 // the highest sequence committed, as a string; a snapshot id is `snap-<n>`.
 // `delta(since)` returns rows whose sequence is greater than `since`.
 
-import { createServer, type IncomingMessage, type Server } from "node:http";
-import type { AddressInfo, Socket } from "node:net";
-import { createHash } from "node:crypto";
-
-const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-/** Encodes a text payload as a single unmasked server websocket frame. */
-function encodeWsText(payload: string): Buffer {
-  const body = Buffer.from(payload, "utf8");
-  const len = body.length;
-  let header: Buffer;
-  if (len < 126) header = Buffer.from([0x81, len]);
-  else if (len < 65536) header = Buffer.from([0x81, 126, (len >> 8) & 0xff, len & 0xff]);
-  else {
-    header = Buffer.alloc(10);
-    header[0] = 0x81;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(len), 2);
-  }
-  return Buffer.concat([header, body]);
-}
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 
 interface StoredRow {
   seq: number;
@@ -84,10 +65,6 @@ export interface MockEndpoint {
   tableState(name: string): MockTable;
   /** Requests seen, for assertions. */
   requests: { method: string; path: string; body?: unknown }[];
-  /** Pushes a `change` frame to every attached change-feed socket. */
-  pushChange(change: { seq: number; table: string; snapshotId?: string; committedAt?: string }): void;
-  /** Resolves once at least `n` change-feed sockets have attached. */
-  waitForFeed(n: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -128,8 +105,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
       const { port } = server.address() as AddressInfo;
       return send(200, {
         catalog_uri: `http://127.0.0.1:${port}`,
-        query_uri: `http://127.0.0.1:${port}`,
-        s3_endpoint: "http://127.0.0.1:8333",
       });
     }
 
@@ -274,37 +249,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     return send(405, { error: "method not allowed" });
   });
 
-  // The catalog change feed lives at the same origin as the HTTP contract, so a
-  // client's `follow`/`followRows` connects here. A minimal RFC 6455 endpoint:
-  // handshake, send `hello`, discard client frames, and let a test push changes.
-  const feedSockets: Socket[] = [];
-  let feedWaiters: (() => void)[] = [];
-  server.on("upgrade", (req: IncomingMessage, socket: Socket) => {
-    if (req.url !== "/v1/catalog/feed" || req.headers.authorization !== `Bearer ${token}`) {
-      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-    const accept = createHash("sha1")
-      .update((req.headers["sec-websocket-key"] ?? "") + WS_GUID)
-      .digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-    socket.on("data", () => void 0); // discard client subscribe frames
-    socket.on("error", () => void 0);
-    socket.on("close", () => {
-      const i = feedSockets.indexOf(socket);
-      if (i >= 0) feedSockets.splice(i, 1);
-    });
-    socket.write(encodeWsText(JSON.stringify({ type: "hello", cursor: 0 })));
-    feedSockets.push(socket);
-    const waiters = feedWaiters;
-    feedWaiters = [];
-    for (const w of waiters) w();
-  });
-
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
 
@@ -313,31 +257,8 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     token,
     tableState,
     requests,
-    pushChange: (change) => {
-      const frame = encodeWsText(
-        JSON.stringify({
-          type: "change",
-          seq: change.seq,
-          table: change.table,
-          snapshot_id: change.snapshotId ?? `snap-${change.seq}`,
-          committed_at: change.committedAt ?? new Date().toISOString(),
-        }),
-      );
-      for (const s of feedSockets) s.write(frame);
-    },
-    waitForFeed: (n: number): Promise<void> => {
-      if (feedSockets.length >= n) return Promise.resolve();
-      return new Promise<void>((resolve) => {
-        const check = () => {
-          if (feedSockets.length >= n) resolve();
-          else feedWaiters.push(check);
-        };
-        feedWaiters.push(check);
-      });
-    },
     close: () =>
       new Promise<void>((resolve) => {
-        for (const s of feedSockets) s.destroy();
         server.close(() => resolve());
       }),
   };
