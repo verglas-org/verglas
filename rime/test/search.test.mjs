@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   CandidateGraph,
   RimeStateStore,
-  VerglasGraphStore,
   normalizeEvaluation,
   selectProposalBatch,
 } from "../src/index.mjs";
@@ -355,75 +354,6 @@ test("rejects invalid configuration and evaluator results", async () => {
     }),
     /task.*finite/,
   );
-});
-
-test("persists search batches as closed Verglas graph waves", async () => {
-  const calls = [];
-  const graphHandle = {
-    create: async () => calls.push(["create"]),
-    insertNodes: async (nodes) => calls.push(["nodes", nodes]),
-    insertEdges: async (edges) => calls.push(["edges", edges]),
-  };
-  const store = new VerglasGraphStore({
-    graph: graphHandle,
-    runId: "run-42",
-  });
-  const engine = createSearch({
-    initialDrafts: 1,
-    concurrency: 1,
-    candidateBudget: 1,
-    maxDebugDepth: 1,
-    debugProbability: 1,
-    random: () => 0,
-    stateStore: store,
-    propose: async () => ({
-      solution: { commit: "abc123" },
-      summary: "Use an atomic compare-and-swap",
-    }),
-    evaluate: async () => valid(0.8),
-  });
-
-  const result = await engine.run({
-    solution: { commit: "baseline" },
-    summary: "Duplicate delivery reproduced",
-    evaluation: buggy("duplicate observed"),
-  });
-
-  const labels = calls
-    .filter(([kind]) => kind === "nodes")
-    .flatMap(([, nodes]) => nodes.map(({ labels: [label] }) => label));
-  assert.ok(labels.includes("RimeWave"));
-  assert.ok(labels.includes("RimeAttempt"));
-  assert.ok(labels.includes("RimeGateEvaluation"));
-  assert.ok(labels.includes("RimeMetricMeasurement"));
-  assert.equal(labels.at(-1), "RimeWaveClosed");
-  const attemptNode = calls
-    .filter(([kind]) => kind === "nodes")
-    .flatMap(([, nodes]) => nodes)
-    .find(({ labels: [label] }) => label === "RimeAttempt");
-  assert.deepEqual(
-    {
-      preferences: attemptNode.properties.preferences,
-      agent: attemptNode.properties.agent,
-      model: attemptNode.properties.model,
-    },
-    {
-      preferences: ["low-cost"],
-      agent: "test",
-      model: "fast",
-    },
-  );
-  const produced = calls
-    .filter(([kind]) => kind === "edges")
-    .flatMap(([, edges]) => edges)
-    .find(({ predicate }) => predicate === "produced");
-  assert.deepEqual(produced.properties.execution, {
-    agent: "test",
-    model: "fast",
-  });
-  assert.equal(produced.properties.assignmentMatched, true);
-  assert.equal(result.state.waves[0].closed, true);
-  assert.equal(result.state.candidateMatrix[1].score, 0.872727272727);
 });
 
 test("uses AIDE's debugging probability and random leaf selection", () => {

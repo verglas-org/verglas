@@ -67,4 +67,5 @@
   The positive assertions on the current `verglas:rime-worker` name already
   fail if the rename regresses.
 - #137: Updated the RIME graph reference to call the precedent capability SearchPrecedents.
+- #171: Removed the obsolete Verglas graph and recursive graph adapters, project graph hooks, graph/vector skills, dashboards, and dependent tests. RIME's candidate search, evaluator, workspace lifecycle, host workers, and state store remain independent and continue to ship.
 
