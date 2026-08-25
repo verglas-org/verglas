@@ -299,15 +299,12 @@ test('structured schemas preserve invalid ingestion and drop them from processin
   assert.equal(observed.body.input_records, records.length);
   assert.equal(observed.body.decode_errors, 3);
   assert.deepEqual(observed.body.user_errors, {
-    invalid_json: 0,
-    not_array: 0,
-    request_limit: 0,
-    record_limit: 0,
-    field_limit: 0,
-    list_limit: 0,
-    missing_required_field: 1,
-    unknown_field: 1,
-    schema_type_mismatch: 1,
+    deserialization: {
+      missing_field: 1,
+      type_mismatch: 1,
+      parse_failure: 1,
+      null_value: 0,
+    },
   });
   assert.deepEqual(observed.body.extensions, {
     ordering_violations: 0,
@@ -365,7 +362,7 @@ test('structured schema configuration is immutable across restart and rejects un
   const observed = await metrics(secondHandler);
   assert.equal(observed.body.input_records, 3);
   assert.equal(observed.body.decode_errors, 1);
-  assert.equal(observed.body.user_errors.missing_required_field, 1);
+  assert.equal(observed.body.user_errors.deserialization.missing_field, 1);
 
   const changedSchema = { fields: [{ name: 'different', type: 'string', required: true }] };
   const changed = createHandler(loaded.project, {
@@ -438,7 +435,7 @@ test('the encoded request ceiling remains hard at 5 MiB', async (t) => {
   assert.equal(rejected.status, 413);
   assert.deepEqual((await readRecords(handler, 0, 10)).body.records, []);
   const observed = await metrics(handler);
-  assert.equal(observed.body.user_errors.request_limit, 1);
+  assert.equal(observed.body.user_errors.deserialization.parse_failure, 1);
 });
 
 test('malformed JSON increments its documented decode family', async (t) => {
@@ -456,7 +453,7 @@ test('malformed JSON increments its documented decode family', async (t) => {
   assert.equal(rejected.status, 400);
   const observed = await metrics(handler);
   assert.equal(observed.body.decode_errors, 1);
-  assert.equal(observed.body.user_errors.invalid_json, 1);
+  assert.equal(observed.body.user_errors.deserialization.parse_failure, 1);
 });
 
 test('Stream source has no disallowed integration imports or bindings', async (t) => {

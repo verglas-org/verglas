@@ -27,11 +27,14 @@ a different schema fails; there is no update, migration, version, or fallback
 path. Every record is validated before the event commits, but ingestion stores
 the original JSON, its sequence, and its deterministic validation outcome.
 Ingestion confirms both valid and invalid records. Processing reads omit invalid
-positions and increment one of these documented user-error families:
-`invalid_json`, `not_array`, `request_limit`, `record_limit`, `field_limit`,
-`list_limit`, `missing_required_field`, `unknown_field`, and
-`schema_type_mismatch`. A mixed structured append returns `accepted`, `invalid`,
-a contiguous `sequences` array, and ordered `errors`; its read response returns
+positions and increment the documented `deserialization` user-error family.
+Its error types are `missing_field`, `type_mismatch`, `parse_failure`, and
+`null_value`. The append `errors` list retains deterministic Verglas validation
+outcomes (`invalid_json`, `not_array`, `request_limit`, `record_limit`,
+`field_limit`, `list_limit`, `missing_required_field`, `unknown_field`, and
+`schema_type_mismatch`) that map to those metric types. A mixed structured append
+returns `accepted`, `invalid`, a contiguous `sequences` array, and ordered
+`errors`; its read response returns
 valid records, `skipped` validation positions, and `next_after` at the last
 scanned sequence. Only processable records participate in downstream exactly-once
 processing. An unstructured successful batch keeps the original
@@ -42,8 +45,9 @@ The hard ceilings are a 5 MiB encoded request, 10,000 records per request, a
 fields, 8 schema nesting levels, 128-byte field names, and a 64 KiB schema.
 
 The operator endpoint is `GET https://verglas.internal/stream/metrics` and
-returns durable `input_bytes`, `input_records`, `decode_errors`, and per-family
-`user_errors`. The `extensions` object contains only labeled Verglas additions:
+returns durable `input_bytes`, `input_records`, `decode_errors`, and
+`user_errors: { deserialization: { missing_field, type_mismatch, parse_failure,
+null_value } }`. The `extensions` object contains only labeled Verglas additions:
 `ordering_violations`, `backpressure_events`, and `lag_records`.
 
 The internal append route is `POST https://verglas.internal/stream/append` with

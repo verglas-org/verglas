@@ -21,6 +21,7 @@ export const USER_ERROR_FAMILIES = Object.freeze([
   'field_limit',
   'list_limit',
   'missing_required_field',
+  'null_value',
   'unknown_field',
   'schema_type_mismatch',
 ]);
@@ -83,6 +84,41 @@ export function emptyUserErrors() {
 export function incrementUserError(target, family) {
   if (!Object.hasOwn(target, family)) throw new Error(`unknown user-error family: ${family}`);
   target[family] += 1;
+}
+
+/**
+ * Converts Verglas's stable validation outcomes to Cloudflare's documented
+ * deserialization family and error-type dimensions for operator metrics.
+ * @param {Record<string, number>} counts
+ * @returns {{deserialization: Record<string, number>}}
+ */
+export function documentedUserErrors(counts) {
+  const result = {
+    deserialization: {
+      missing_field: 0,
+      type_mismatch: 0,
+      parse_failure: 0,
+      null_value: 0,
+    },
+  };
+  const typeByFamily = {
+    missing_required_field: 'missing_field',
+    null_value: 'null_value',
+    schema_type_mismatch: 'type_mismatch',
+    invalid_json: 'parse_failure',
+    not_array: 'parse_failure',
+    request_limit: 'parse_failure',
+    record_limit: 'parse_failure',
+    field_limit: 'parse_failure',
+    list_limit: 'parse_failure',
+    unknown_field: 'parse_failure',
+  };
+  for (const [family, count] of Object.entries(counts)) {
+    const type = typeByFamily[family];
+    if (type === undefined) throw new Error(`unknown user-error family: ${family}`);
+    result.deserialization[type] += count;
+  }
+  return result;
 }
 
 /** @param {unknown} value @returns {boolean} */
@@ -183,6 +219,7 @@ function validateStruct(record, fields) {
       if (field.required) return 'missing_required_field';
       continue;
     }
+    if (field.required && record[field.name] === null) return 'null_value';
     const family = validateType(record[field.name], field);
     if (family) return family;
   }

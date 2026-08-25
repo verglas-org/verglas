@@ -6,6 +6,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import {
+  documentedUserErrors,
   emptyUserErrors,
   incrementUserError,
   MAX_RECORDS_PER_REQUEST,
@@ -265,7 +266,7 @@ export class Stream extends DurableObject {
       input_bytes: Number(row.input_bytes),
       input_records: Number(row.input_records),
       decode_errors: Number(row.decode_errors),
-      user_errors: JSON.parse(row.user_errors_json),
+      user_errors: documentedUserErrors(JSON.parse(row.user_errors_json)),
       extensions: {
         ordering_violations: Number(row.ordering_violations),
         backpressure_events: Number(row.backpressure_events),
