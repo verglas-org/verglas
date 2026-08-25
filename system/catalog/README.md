@@ -14,34 +14,50 @@ credential, or raw network capability. It declares one narrow service binding:
 { "binding": "ICEBERG_COMMIT", "service": "verglas-runtime" }
 ```
 
-`verglas-runtime` intercepts that exact declared binding for deterministic
-Iceberg publication. It is infrastructure, not another public product.
+`verglas-runtime` intercepts that exact declared binding to write immutable
+Iceberg data and metadata proposals. It is infrastructure, not another public
+product, and it does not own a Catalog head.
 
 ## Durable state
 
-The Catalog Durable Object owns its state in Turso:
+The Catalog Durable Object is the Catalog authority. Turso/SQLite stores:
 
 - immutable deployment configuration and its canonical SHA-256 digest;
-- namespace and table registry rows used by the public REST API;
-- the confirmed Sink batch ledger.
+- multipart namespace arrays and string properties;
+- each table's complete Iceberg metadata and current metadata location;
+- standard UUIDv7 REST idempotency receipts;
+- confirmed Sink batch receipts.
+
+A runtime proposal becomes visible only when the object installs its metadata
+location and receipt in the host-owned event transaction. Local Foyer contents
+and unreferenced immutable objects are not Catalog state.
 
 Changing immutable configuration requires deleting and recreating the object.
 The deployment variables are `CATALOG_ID`, `CATALOG_WAREHOUSE`,
 `CATALOG_BUCKET`, `CATALOG_NAMESPACE`, `CATALOG_TABLE`, and `CATALOG_SINK_ID`.
-A request cannot select a different destination or Sink.
+The final four fence the configured Sink destination; they do not restrict the
+public REST namespace/table registry.
 
-## Public REST protocol
+## Iceberg REST protocol
 
-The public Worker routes allowlisted `/v1` requests to the named Catalog object.
-The object serves namespace and table state directly from Turso. It never
-forwards REST to another process or object. The implemented write surface is:
+The public Worker allowlists standard `/v1` requests and forwards them to the
+named Catalog object. The object implements:
 
-- `POST /v1/namespaces`;
-- `POST /v1/namespaces/{namespace}/tables`.
+- `GET /v1/config`;
+- namespace list/create/load/property-update/delete;
+- table list/create/load/HEAD/commit/delete;
+- table registration from an existing metadata location;
+- atomic table rename.
 
-`GET` and `HEAD` can load registered tables, and `GET /v1/config` returns
-non-secret defaults. Unsupported paths and methods fail closed. Internal
-`/catalog/commit` and `/catalog/status` are not public Worker routes.
+Namespaces use Iceberg's multipart array representation and unit-separator path
+encoding. Table load and commit responses contain both `metadata-location` and
+complete Iceberg `metadata`. Non-success responses use the standard nested
+Iceberg error envelope. Table commits preserve `requirements` and `updates` for
+the runtime's patched Iceberg validator, then advance only the SQLite head.
+
+Internal `/catalog/commit` and `/catalog/status` are not public Worker routes.
+The REST behavior is independently exercised through PyIceberg 0.11.1 under
+`interoperability/`.
 
 ## Sink commit protocol
 
@@ -51,23 +67,27 @@ content type, deterministic batch/file identities, destination ownership,
 compression and roll policy, the 8 MiB body ceiling, and the 10,000-row ceiling.
 
 The object computes a canonical payload digest and checks its Turso ledger. An
-exact replay returns the stored receipt without invoking the runtime. Reusing a
-batch identity with a different payload returns 409. A new batch invokes only
-`env.ICEBERG_COMMIT.fetch(request)`. A valid runtime receipt must confirm the
-same batch, file, and row count before the object inserts its ledger row.
+exact replay returns the stored receipt without invoking runtime. Reusing a
+batch identity with a different payload returns 409. A new batch sends the
+current SQLite metadata location and deterministic batch to the runtime. After
+validating the returned metadata proposal, the object installs the table head
+and Sink receipt in the same event transaction before acknowledging Sink.
 
-A lost runtime response inserts no ledger row. Retry sends the identical batch
-and file identity, and runtime Iceberg replay detection closes the
-snapshot-before-ledger window.
+A lost runtime response installs no SQLite head or receipt. Retrying may leave
+an unreferenced immutable metadata object, but only the pointer committed by the
+Catalog DO is visible to Iceberg clients.
 
 ## Tests
 
 ```sh
 npm test
+/Users/jfbrown/code/cascadelabs/.venv/bin/python \
+  interoperability/pyiceberg_rest_compat.py
 ```
 
-Tests use persisted SQLite as the Turso host seam. They cover Catalog-owned REST
-state across restart with zero capability calls, public/internal route
-separation, immutable configuration, exact ledger replay, lost responses,
-identity and destination mismatches, hard ceilings, receipt validation, strict
-static closure, and a real `world service` component build with no WASI imports.
+The unit/build suite covers persisted SQLite restart behavior, multipart
+namespaces, complete metadata responses, standard commits, registration,
+rename/drop, idempotency conflicts, public/internal route separation, immutable
+configuration, Sink replay, lost responses, hard ceilings, receipt validation,
+static capability closure, and a real `world service` component build without
+WASI imports.

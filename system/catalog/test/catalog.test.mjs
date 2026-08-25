@@ -21,11 +21,12 @@ const FILE_ID = 'verglas/primary/batch-8a99034b7b97cd6a8ec9d413c3ba498644887a818
 class PersistedHost {
   constructor(path) {
     this.database = new DatabaseSync(path);
-    this.authorityCalls = [];
-    this.authorityRecords = new Map();
-    this.authorityFailure = undefined;
+    this.runtimeCalls = [];
+    this.runtimeReceipts = new Map();
+    this.metadataRecords = new Map();
+    this.runtimeFailure = undefined;
     this.loseAuthorityResponse = false;
-    this.authorityMismatch = undefined;
+    this.runtimeMismatch = undefined;
     this.catalogHandler = undefined;
   }
 
@@ -44,30 +45,99 @@ class PersistedHost {
       return this.catalogHandler.fetch(request);
     }
     if (binding === 'ICEBERG_COMMIT' && object === 'verglas-runtime') {
-      return this.authorityFetch(request, object);
+      return this.runtimeFetch(request, object);
     }
     throw new Error(`unexpected binding ${binding} object ${object}`);
   }
 
-  authorityFetch(request, object) {
+  runtimeFetch(request, object) {
     const body = decoder.decode(request.body);
     const payload = JSON.parse(body);
-    this.authorityCalls.push({ request, object, body, payload });
-    if (!Object.hasOwn(payload, 'batch_id')) return response(200, { ok: true });
-    if (this.authorityFailure) return response(this.authorityFailure, { error: 'authority unavailable' });
-    const prior = this.authorityRecords.get(payload.batch_id);
+    this.runtimeCalls.push({ request, object, body, payload });
+    if (payload.operation === 'create-table') {
+      const location = payload.request.location
+        ?? `s3://lake/${payload.namespace.join('/')}/${payload.request.name}`;
+      const publication = {
+        'metadata-location': `${location}/metadata/00000.json`,
+        metadata: {
+          'format-version': 2,
+          'table-uuid': '00000000-0000-4000-8000-000000000001',
+          location,
+          'last-updated-ms': 1,
+          'last-column-id': 0,
+          schemas: [payload.request.schema],
+          'current-schema-id': payload.request.schema['schema-id'],
+          'partition-specs': [{ 'spec-id': 0, fields: [] }],
+          'default-spec-id': 0,
+          'last-partition-id': 999,
+          'sort-orders': [{ 'order-id': 0, fields: [] }],
+          'default-sort-order-id': 0,
+          properties: payload.request.properties ?? {},
+          snapshots: [],
+          refs: {},
+          'last-sequence-number': 0,
+          'snapshot-log': [],
+          'metadata-log': [],
+        },
+      };
+      this.metadataRecords.set(publication['metadata-location'], publication.metadata);
+      return response(200, publication);
+    }
+    if (payload.operation === 'register-table') {
+      const metadata = this.metadataRecords.get(payload.metadata_location);
+      return metadata
+        ? response(200, { 'metadata-location': payload.metadata_location, metadata })
+        : response(404, { error: 'metadata not found' });
+    }
+    if (payload.operation === 'commit-table') {
+      const previous = this.metadataRecords.get(payload.current_metadata_location);
+      if (!previous) return response(404, { error: 'metadata not found' });
+      const metadata = structuredClone(previous);
+      const tableCommit = JSON.parse(payload.request_json);
+      for (const requirement of tableCommit.requirements) {
+        if (requirement.type === 'assert-table-uuid' && requirement.uuid !== metadata['table-uuid']) {
+          return response(409, { error: { message: 'table UUID requirement failed' } });
+        }
+      }
+      for (const update of tableCommit.updates) {
+        if (update.action === 'set-properties') {
+          metadata.properties = { ...(metadata.properties ?? {}), ...update.updates };
+        } else if (update.action === 'remove-properties') {
+          for (const key of update.removals) delete metadata.properties[key];
+        } else {
+          return response(400, { error: `unsupported test update ${update.action}` });
+        }
+      }
+      metadata['last-updated-ms'] += 1;
+      const metadataLocation = metadata.location + '/metadata/00001.json';
+      this.metadataRecords.set(metadataLocation, metadata);
+      return response(200, { 'metadata-location': metadataLocation, metadata });
+    }
+    if (payload.operation !== 'commit-sink-batch') return response(400, { error: 'unknown operation' });
+    const commit = payload.request;
+    if (this.runtimeFailure) return response(this.runtimeFailure, { error: 'runtime unavailable' });
+    const prior = this.runtimeReceipts.get(commit.batch_id);
     const receipt = prior ?? {
       committed: true,
-      batch_id: payload.batch_id,
-      file_id: payload.file_id,
+      batch_id: commit.batch_id,
+      file_id: commit.file_id,
       snapshot_id: 'snapshot-42',
-      rows_committed: payload.records.length,
+      metadata_location: 's3://lake/analytics/events/metadata/00001.json',
+      metadata: {
+        'format-version': 2,
+        'table-uuid': '00000000-0000-4000-8000-000000000042',
+        location: 's3://lake/analytics/events',
+        'current-snapshot-id': 42,
+        schemas: [{ type: 'struct', 'schema-id': 0, fields: [] }],
+        'current-schema-id': 0,
+      },
+      rows_committed: commit.records.length,
     };
-    this.authorityRecords.set(payload.batch_id, receipt);
-    if (this.authorityMismatch) return response(200, { ...receipt, ...this.authorityMismatch });
+    this.runtimeReceipts.set(commit.batch_id, receipt);
+    if (this.runtimeMismatch) return response(200, { ...receipt, ...this.runtimeMismatch });
     if (this.loseAuthorityResponse) {
       this.loseAuthorityResponse = false;
-      throw new Error('authority committed but response was lost');
+      throw new Error('runtime proposal completed but response was lost');
     }
     return response(200, receipt);
   }
@@ -194,7 +264,73 @@ async function fixture(t, vars = {}) {
   return { loaded, directory, path, host, handler };
 }
 
-test('owns namespace and table REST state across restart without a capability call', async (t) => {
+test('serves the Iceberg REST config and multipart namespace contract from SQLite', async (t) => {
+  const fixtureValue = await fixture(t);
+  const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
+  const config = await worker.fetch(publicRequest('GET', 'https://catalog.example/v1/config'));
+  assert.equal(config.status, 200);
+  const configPayload = await readJson(config);
+  assert.deepEqual(configPayload.defaults, { warehouse: 'warehouse' });
+  assert.deepEqual(configPayload.overrides, {});
+  assert.ok(configPayload.endpoints.includes('GET /v1/{prefix}/namespaces/{namespace}'));
+
+  const created = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces',
+    JSON.stringify({ namespace: ['analytics', 'raw'], properties: { owner: 'test' } }),
+    { 'content-type': 'application/json' },
+  ));
+  assert.equal(created.status, 200, decoder.decode(created.body));
+  assert.deepEqual(await readJson(created), {
+    namespace: ['analytics', 'raw'],
+    properties: { owner: 'test' },
+  });
+
+  const loaded = await worker.fetch(publicRequest(
+    'GET',
+    'https://catalog.example/v1/namespaces/analytics%1Fraw',
+  ));
+  assert.equal(loaded.status, 200, decoder.decode(loaded.body));
+  assert.deepEqual(await readJson(loaded), {
+    namespace: ['analytics', 'raw'],
+    properties: { owner: 'test' },
+  });
+
+  const updated = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics%1Fraw/properties',
+    JSON.stringify({ removals: ['owner'], updates: { domain: 'events' } }),
+    { 'content-type': 'application/json' },
+  ));
+  assert.equal(updated.status, 200, decoder.decode(updated.body));
+  assert.deepEqual(await readJson(updated), {
+    removed: ['owner'],
+    updated: ['domain'],
+    missing: [],
+  });
+
+  const listed = await worker.fetch(publicRequest(
+    'GET',
+    'https://catalog.example/v1/namespaces?parent=analytics',
+  ));
+  assert.equal(listed.status, 200, decoder.decode(listed.body));
+  assert.deepEqual(await readJson(listed), { namespaces: [['analytics', 'raw']] });
+  const missing = await worker.fetch(publicRequest(
+    'GET',
+    'https://catalog.example/v1/namespaces/analytics%1Fmissing',
+  ));
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await readJson(missing), {
+    error: {
+      message: 'namespace does not exist',
+      type: 'NoSuchNamespaceException',
+      code: 404,
+    },
+  });
+  assert.equal(fixtureValue.host.runtimeCalls.length, 0);
+});
+
+test('persists a runtime-authored Iceberg table in SQLite across restart', async (t) => {
   const fixtureValue = await fixture(t);
   const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
   const namespace = await worker.fetch(publicRequest(
@@ -211,7 +347,12 @@ test('owns namespace and table REST state across restart without a capability ca
     { 'content-type': 'application/json' },
   ));
   assert.equal(table.status, 200, decoder.decode(table.body));
-  assert.equal(fixtureValue.host.authorityCalls.length, 0);
+  const createdTable = await readJson(table);
+  assert.equal(createdTable['metadata-location'], 's3://lake/analytics/events/metadata/00000.json');
+  assert.equal(createdTable.metadata['format-version'], 2);
+  assert.equal(createdTable.metadata['table-uuid'], '00000000-0000-4000-8000-000000000001');
+  assert.equal(fixtureValue.host.runtimeCalls.length, 1);
+  assert.equal(fixtureValue.host.runtimeCalls[0].payload.operation, 'create-table');
 
   await makeHandler(fixtureValue.loaded.project, fixtureValue.host);
   const restarted = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
@@ -221,9 +362,154 @@ test('owns namespace and table REST state across restart without a capability ca
   ));
   assert.equal(loaded.status, 200, decoder.decode(loaded.body));
   const payload = await readJson(loaded);
-  assert.equal(payload.metadata.name, 'events');
-  assert.deepEqual(payload.metadata.schema, { type: 'struct', 'schema-id': 0, fields: [] });
-  assert.equal(fixtureValue.host.authorityCalls.length, 0);
+  assert.equal(payload['metadata-location'], 's3://lake/analytics/events/metadata/00000.json');
+  assert.equal(payload.metadata.location, 's3://lake/analytics/events');
+  assert.deepEqual(payload.metadata.schemas, [{ type: 'struct', 'schema-id': 0, fields: [] }]);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 1);
+});
+
+test('commits standard Iceberg requirements and updates through the SQLite head', async (t) => {
+  const fixtureValue = await fixture(t);
+  const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
+  await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces',
+    JSON.stringify({ namespace: ['analytics'] }),
+    { 'content-type': 'application/json' },
+  ));
+  await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics/tables',
+    JSON.stringify({ name: 'events', schema: { type: 'struct', 'schema-id': 0, fields: [] } }),
+    { 'content-type': 'application/json' },
+  ));
+  const commitPayload = {
+    identifier: { namespace: ['analytics'], name: 'events' },
+    requirements: [{
+      type: 'assert-table-uuid',
+      uuid: '00000000-0000-4000-8000-000000000001',
+    }],
+    updates: [{ action: 'set-properties', updates: { owner: 'pyiceberg' } }],
+  };
+  const commitHeaders = {
+    'content-type': 'application/json',
+    'idempotency-key': '01890f3e-7cc2-7cc2-8000-000000000001',
+  };
+  const committed = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics/tables/events',
+    JSON.stringify(commitPayload),
+    commitHeaders,
+  ));
+  assert.equal(committed.status, 200, decoder.decode(committed.body));
+  const payload = await readJson(committed);
+  assert.equal(payload['metadata-location'], 's3://lake/analytics/events/metadata/00001.json');
+  assert.equal(payload.metadata.properties.owner, 'pyiceberg');
+  assert.equal(fixtureValue.host.runtimeCalls.length, 2);
+  assert.equal(fixtureValue.host.runtimeCalls[1].payload.operation, 'commit-table');
+  assert.equal(fixtureValue.host.runtimeCalls[1].payload.request_json, JSON.stringify(commitPayload));
+  assert.equal('request' in fixtureValue.host.runtimeCalls[1].payload, false);
+  const replay = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics/tables/events',
+    JSON.stringify(commitPayload),
+    commitHeaders,
+  ));
+  assert.deepEqual(await readJson(replay), payload);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 2);
+  const conflict = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics/tables/events',
+    JSON.stringify({ ...commitPayload, updates: [{ action: 'set-properties', updates: { owner: 'other' } }] }),
+    commitHeaders,
+  ));
+  assert.equal(conflict.status, 409);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 2);
+  const stale = await worker.fetch(publicRequest(
+    'POST',
+    'https://catalog.example/v1/namespaces/analytics/tables/events',
+    JSON.stringify({
+      ...commitPayload,
+      requirements: [{ type: 'assert-table-uuid', uuid: '00000000-0000-4000-8000-000000000099' }],
+    }),
+    {
+      'content-type': 'application/json',
+      'idempotency-key': '01890f3e-7cc2-7cc2-8000-000000000002',
+    },
+  ));
+  assert.equal(stale.status, 409);
+
+  const loaded = await worker.fetch(publicRequest(
+    'GET',
+    'https://catalog.example/v1/namespaces/analytics/tables/events',
+  ));
+  assert.deepEqual(await readJson(loaded), payload);
+});
+
+test('renames and drops table pointers with standard Iceberg routes', async (t) => {
+  const fixtureValue = await fixture(t);
+  const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
+  await worker.fetch(publicRequest(
+    'POST', 'https://catalog.example/v1/namespaces',
+    JSON.stringify({ namespace: ['analytics'] }), { 'content-type': 'application/json' },
+  ));
+  await worker.fetch(publicRequest(
+    'POST', 'https://catalog.example/v1/namespaces/analytics/tables',
+    JSON.stringify({ name: 'events', schema: { type: 'struct', 'schema-id': 0, fields: [] } }),
+    { 'content-type': 'application/json' },
+  ));
+  const renamed = await worker.fetch(publicRequest(
+    'POST', 'https://catalog.example/v1/tables/rename',
+    JSON.stringify({
+      source: { namespace: ['analytics'], name: 'events' },
+      destination: { namespace: ['analytics'], name: 'events_archive' },
+    }),
+    { 'content-type': 'application/json' },
+  ));
+  assert.equal(renamed.status, 204, decoder.decode(renamed.body));
+  const loaded = await worker.fetch(publicRequest(
+    'GET', 'https://catalog.example/v1/namespaces/analytics/tables/events_archive',
+  ));
+  assert.equal(loaded.status, 200, decoder.decode(loaded.body));
+  const dropped = await worker.fetch(publicRequest(
+    'DELETE', 'https://catalog.example/v1/namespaces/analytics/tables/events_archive',
+  ));
+  assert.equal(dropped.status, 204, decoder.decode(dropped.body));
+  const missing = await worker.fetch(publicRequest(
+    'GET', 'https://catalog.example/v1/namespaces/analytics/tables/events_archive',
+  ));
+  assert.equal(missing.status, 404);
+});
+
+test('registers an existing Iceberg metadata location as a SQLite table head', async (t) => {
+  const fixtureValue = await fixture(t);
+  const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
+  await worker.fetch(publicRequest(
+    'POST', 'https://catalog.example/v1/namespaces',
+    JSON.stringify({ namespace: ['analytics'] }), { 'content-type': 'application/json' },
+  ));
+  const created = await worker.fetch(publicRequest(
+    'POST', 'https://catalog.example/v1/namespaces/analytics/tables',
+    JSON.stringify({ name: 'events', schema: { type: 'struct', 'schema-id': 0, fields: [] } }),
+    { 'content-type': 'application/json' },
+  ));
+  const metadataLocation = (await readJson(created))['metadata-location'];
+  await worker.fetch(publicRequest(
+    'DELETE', 'https://catalog.example/v1/namespaces/analytics/tables/events',
+  ));
+  const registered = await worker.fetch(publicRequest(
+    'POST', 'https://catalog.example/v1/namespaces/analytics/register',
+    JSON.stringify({ name: 'registered_events', 'metadata-location': metadataLocation }),
+    { 'content-type': 'application/json' },
+  ));
+  assert.equal(registered.status, 200, decoder.decode(registered.body));
+  const payload = await readJson(registered);
+  assert.equal(payload['metadata-location'], metadataLocation);
+  assert.equal(payload.metadata['table-uuid'], '00000000-0000-4000-8000-000000000001');
+  const loaded = await worker.fetch(publicRequest(
+    'GET', 'https://catalog.example/v1/namespaces/analytics/tables/registered_events',
+  ));
+  assert.deepEqual(await readJson(loaded), payload);
 });
 
 test('does not expose commit or status on the public Worker', async (t) => {
@@ -237,10 +523,10 @@ test('does not expose commit or status on the public Worker', async (t) => {
     const result = await worker.fetch(publicRequest(method, uri));
     assert.equal(result.status, 404);
   }
-  assert.equal(fixtureValue.host.authorityCalls.length, 0);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 0);
 });
 
-test('commits a valid batch and exact ledger replay makes one authority call', async (t) => {
+test('commits a valid batch and exact ledger replay makes one runtime proposal call', async (t) => {
   const fixtureValue = await fixture(t);
   const first = await fixtureValue.handler.fetch(commitRequest());
   const retry = await fixtureValue.handler.fetch(commitRequest());
@@ -252,22 +538,32 @@ test('commits a valid batch and exact ledger replay makes one authority call', a
     batch_id: BATCH_ID,
     file_id: FILE_ID,
     snapshot_id: 'snapshot-42',
+    metadata_location: 's3://lake/analytics/events/metadata/00001.json',
     rows_committed: 2,
   });
-  assert.equal(fixtureValue.host.authorityCalls.length, 1);
-  const call = fixtureValue.host.authorityCalls[0];
+  assert.equal(fixtureValue.host.runtimeCalls.length, 1);
+  const call = fixtureValue.host.runtimeCalls[0];
   assert.equal(call.object, 'verglas-runtime');
   assert.equal(call.request.method, 'POST');
   assert.equal(call.request.uri, 'https://verglas.internal/catalog/commit');
   assert.equal(call.request.headers.find(([name]) => name === 'x-verglas-sink-id')?.[1], 'primary');
   assert.equal(call.request.headers.find(([name]) => name === 'x-verglas-batch-id')?.[1], BATCH_ID);
   assert.equal(call.request.headers.find(([name]) => name === 'x-verglas-file-id')?.[1], FILE_ID);
-  assert.deepEqual(call.payload, commitBody());
+  assert.equal(call.payload.operation, 'commit-sink-batch');
+  assert.equal(call.payload.current_metadata_location, null);
+  assert.deepEqual(call.payload.request, commitBody());
   const status = await fixtureValue.handler.fetch(request('GET', 'https://verglas.internal/catalog/status'));
   assert.equal((await readJson(status)).confirmed_batches, 1);
+  const table = await fixtureValue.handler.fetch(request(
+    'GET',
+    'https://verglas.internal/v1/namespaces/analytics/tables/events',
+  ));
+  const tablePayload = await readJson(table);
+  assert.equal(tablePayload['metadata-location'], 's3://lake/analytics/events/metadata/00001.json');
+  assert.equal(tablePayload.metadata['current-snapshot-id'], 42);
 });
 
-test('a lost authority response and restart retries the same identity', async (t) => {
+test('a lost runtime response and restart retries the same identity', async (t) => {
   const loaded = await loadProject();
   const directory = await mkdtemp(join(tmpdir(), 'verglas-catalog-restart-'));
   const path = join(directory, 'catalog.sqlite');
@@ -276,17 +572,17 @@ test('a lost authority response and restart retries the same identity', async (t
   firstHost.loseAuthorityResponse = true;
   const lost = await first.fetch(commitRequest());
   assert.equal(lost.status, 502);
-  const firstCall = firstHost.authorityCalls[0];
+  const firstCall = firstHost.runtimeCalls[0];
   firstHost.close();
 
   const secondHost = new PersistedHost(path);
-  secondHost.authorityRecords = firstHost.authorityRecords;
+  secondHost.runtimeReceipts = firstHost.runtimeReceipts;
   const second = await makeHandler(loaded.project, secondHost);
   const retried = await second.fetch(commitRequest());
   assert.equal(retried.status, 200);
-  assert.equal(secondHost.authorityCalls.length, 1);
-  assert.equal(secondHost.authorityCalls[0].body, firstCall.body);
-  assert.equal(secondHost.authorityCalls[0].request.headers.find(([name]) => name === 'x-verglas-batch-id')?.[1], BATCH_ID);
+  assert.equal(secondHost.runtimeCalls.length, 1);
+  assert.equal(secondHost.runtimeCalls[0].body, firstCall.body);
+  assert.equal(secondHost.runtimeCalls[0].request.headers.find(([name]) => name === 'x-verglas-batch-id')?.[1], BATCH_ID);
   t.after(() => {
     secondHost.close();
     return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
@@ -300,7 +596,7 @@ test('changed payload under a confirmed batch is a hard conflict', async (t) => 
   const result = await fixtureValue.handler.fetch(changed);
   assert.equal(result.status, 409);
   assert.match(decoder.decode(result.body), /different payload|reused/i);
-  assert.equal(fixtureValue.host.authorityCalls.length, 1);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 1);
 });
 
 test('changed immutable deployment configuration requires deleting the object', async (t) => {
@@ -334,10 +630,10 @@ test('request-selected destination and sink configuration must match immutable c
     assert.equal(result.status, 400);
     assert.match(decoder.decode(result.body), expected);
   }
-  assert.equal(fixtureValue.host.authorityCalls.length, 0);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 0);
 });
 
-test('malformed identities and hard request ceilings fail before authority', async (t) => {
+test('malformed identities and hard request ceilings fail before runtime', async (t) => {
   const fixtureValue = await fixture(t);
   const malformed = [
     [commitRequest(commitBody({ batch_id: '["wrong"]' })), /batch/i],
@@ -366,12 +662,12 @@ test('malformed identities and hard request ceilings fail before authority', asy
   const tooLarge = commitBody({ records: [{ value: 'x'.repeat(8 * 1024 * 1024) }] });
   const tooLargeResult = await fixtureValue.handler.fetch(commitRequest(tooLarge));
   assert.equal(tooLargeResult.status, 413);
-  assert.equal(fixtureValue.host.authorityCalls.length, 0);
+  assert.equal(fixtureValue.host.runtimeCalls.length, 0);
 });
 
-test('an authority receipt mismatch is rejected without a ledger row', async (t) => {
+test('a runtime receipt mismatch is rejected without a ledger row', async (t) => {
   const fixtureValue = await fixture(t);
-  fixtureValue.host.authorityMismatch = { rows_committed: 1 };
+  fixtureValue.host.runtimeMismatch = { rows_committed: 1 };
   const result = await fixtureValue.handler.fetch(commitRequest());
   assert.equal(result.status, 502);
   assert.match(decoder.decode(result.body), /row|receipt/i);

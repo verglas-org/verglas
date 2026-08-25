@@ -13,18 +13,37 @@ export const CATALOG_COMMIT_PATH = '/catalog/commit';
 export const CATALOG_STATUS_PATH = '/catalog/status';
 export const MAX_COMMIT_BYTES = 8 * 1024 * 1024;
 export const MAX_COMMIT_ROWS = 10_000;
-export const MAX_AUTHORITY_RESPONSE_BYTES = 64 * 1024;
+export const MAX_RUNTIME_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const MAX_REST_REQUEST_BYTES = 8 * 1024 * 1024;
 export const MIN_ROLL_INTERVAL_SECONDS = 60;
 export const MAX_ROLL_INTERVAL_SECONDS = 24 * 60 * 60;
 export const MAX_ROLL_SIZE_BYTES = 512 * 1024 * 1024;
 
 const CONFIG_TABLE = 'catalog_config';
 const LEDGER_TABLE = 'catalog_ledger';
+const REST_LEDGER_TABLE = 'catalog_rest_commits';
 const NAMESPACE_TABLE = 'catalog_namespaces';
 const TABLE_TABLE = 'catalog_tables';
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
-const LOCATION_MAX_LENGTH = 255;
+const LOCATION_MAX_LENGTH = 4096;
+const NAMESPACE_SEPARATOR = '\u001f';
+const ICEBERG_REST_ENDPOINTS = Object.freeze([
+  'GET /v1/config',
+  'GET /v1/{prefix}/namespaces',
+  'POST /v1/{prefix}/namespaces',
+  'GET /v1/{prefix}/namespaces/{namespace}',
+  'DELETE /v1/{prefix}/namespaces/{namespace}',
+  'POST /v1/{prefix}/namespaces/{namespace}/properties',
+  'GET /v1/{prefix}/namespaces/{namespace}/tables',
+  'POST /v1/{prefix}/namespaces/{namespace}/tables',
+  'POST /v1/{prefix}/namespaces/{namespace}/register',
+  'GET /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+  'HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+  'POST /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+  'DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+  'POST /v1/{prefix}/tables/rename',
+]);
 const COMPRESSION = new Set(['gzip', 'lz4', 'snappy', 'uncompressed', 'zstd']);
 const COMMIT_FIELDS = new Set([
   'batch_id',
@@ -125,7 +144,7 @@ export class Catalog extends DurableObject {
 
   /**
    * Validates one frozen Sink envelope, resolves a durable replay, or performs
-   * one idempotent authority call before inserting the receipt.
+   * one idempotent runtime proposal before inserting the SQLite receipt.
    * @param {Request} request
    * @returns {Promise<Response>}
    */
@@ -146,21 +165,35 @@ export class Catalog extends DurableObject {
         return jsonResponse(JSON.parse(String(existing.receipt_json)));
       }
 
-      const receipt = await commitToAuthority(this.env, this.#config, commit);
-      await execute(
+      const tableRows = await execute(
         this.ctx,
-        `INSERT INTO ${LEDGER_TABLE} (batch_id, payload_digest, file_id, snapshot_id, rows_committed, receipt_json) VALUES (?, ?, ?, ?, ?, ?)`,
-        commit.batchId,
-        commit.payloadDigest,
-        commit.fileId,
-        receipt.snapshot_id,
-        receipt.rows_committed,
-        JSON.stringify(receipt),
+        `SELECT metadata_location FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`,
+        this.#config.namespace,
+        this.#config.table,
       );
+      const currentMetadataLocation = tableRows[0]?.metadata_location === undefined
+        || tableRows[0]?.metadata_location === null
+        ? null
+        : String(tableRows[0].metadata_location);
+      const runtimeProposal = await requestSinkProposal(
+        this.env,
+        this.#config,
+        commit,
+        currentMetadataLocation,
+      );
+      const receipt = {
+        committed: true,
+        batch_id: runtimeProposal.batch_id,
+        file_id: runtimeProposal.file_id,
+        snapshot_id: runtimeProposal.snapshot_id,
+        metadata_location: runtimeProposal.metadata_location,
+        rows_committed: runtimeProposal.rows_committed,
+      };
+      await persistCatalogCommit(this.ctx, this.#config, commit, runtimeProposal, receipt);
       return jsonResponse(receipt);
     } catch (error) {
       if (error instanceof RequestError) return errorResponse(error, error.status);
-      if (error instanceof AuthorityCommitError) return errorResponse(error, 502);
+      if (error instanceof RuntimeProposalError) return errorResponse(error, 502);
       return errorResponse(error, 503);
     }
   }
@@ -176,40 +209,306 @@ export class Catalog extends DurableObject {
       const url = new URL(request.url);
       const method = request.method.toUpperCase();
       if (method === 'GET' && url.pathname === REST_CONFIG_PATH) {
-        return jsonResponse({ defaults: { warehouse: this.#config.warehouse } });
+        return jsonResponse({
+          defaults: { warehouse: this.#config.warehouse },
+          overrides: {},
+          endpoints: ICEBERG_REST_ENDPOINTS,
+        });
       }
-      if (url.pathname === '/v1/namespaces' && method === 'POST') {
-        const body = await readRestJson(request);
-        const namespace = namespaceName(body.namespace);
-        const properties = plainObject(body.properties ?? {}, 'properties');
-        await execute(this.ctx, `INSERT INTO ${NAMESPACE_TABLE} (name, properties_json) VALUES (?, ?)`, namespace, canonicalJson(properties));
-        return jsonResponse({ namespace: [namespace], properties });
+      if (url.pathname === '/v1/tables/rename' && method === 'POST') {
+        return await this.#renameTable(request);
+      }
+      if (url.pathname === '/v1/namespaces') {
+        if (method === 'GET') return await this.#listNamespaces(url);
+        if (method === 'POST') return await this.#createNamespace(request);
+      }
+      const propertiesMatch = /^\/v1\/namespaces\/([^/]+)\/properties$/u.exec(url.pathname);
+      if (propertiesMatch && method === 'POST') {
+        return await this.#updateNamespaceProperties(propertiesMatch[1], request);
+      }
+      const namespaceMatch = /^\/v1\/namespaces\/([^/]+)$/u.exec(url.pathname);
+      if (namespaceMatch) {
+        if (method === 'GET') return await this.#loadNamespace(namespaceMatch[1]);
+        if (method === 'DELETE') return await this.#dropNamespace(namespaceMatch[1]);
+      }
+      const registerMatch = /^\/v1\/namespaces\/([^/]+)\/register$/u.exec(url.pathname);
+      if (registerMatch && method === 'POST') {
+        return await this.#registerTable(registerMatch[1], request);
       }
       const tableMatch = /^\/v1\/namespaces\/([^/]+)\/tables\/([^/]+)$/u.exec(url.pathname);
-      if (tableMatch && (method === 'GET' || method === 'HEAD')) {
-        const namespace = decodeURIComponent(tableMatch[1]);
-        const name = decodeURIComponent(tableMatch[2]);
-        const rows = await execute(this.ctx, `SELECT metadata_json FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace, name);
-        if (!rows[0]) return new Response('not found', { status: 404 });
-        const response = jsonResponse({ metadata: JSON.parse(String(rows[0].metadata_json)) });
-        return method === 'HEAD' ? new Response(null, { status: response.status, headers: response.headers }) : response;
+      if (tableMatch) {
+        if (method === 'POST') return await this.#commitTable(tableMatch[1], tableMatch[2], request);
+        if (method === 'DELETE') return await this.#dropTable(tableMatch[1], tableMatch[2], url);
+        if (method === 'GET' || method === 'HEAD') {
+          const namespace = namespaceFromPath(tableMatch[1]);
+          const name = tableNameFromPath(tableMatch[2]);
+          const rows = await execute(this.ctx, `SELECT metadata_location, metadata_json FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace.key, name);
+          if (!rows[0]) throw new RequestError('table does not exist', 404, 'NoSuchTableException');
+          const response = jsonResponse({
+            'metadata-location': rows[0].metadata_location === null ? null : String(rows[0].metadata_location),
+            metadata: JSON.parse(String(rows[0].metadata_json)),
+            config: {},
+          });
+          return method === 'HEAD' ? new Response(null, { status: 204, headers: response.headers }) : response;
+        }
       }
       const tablesMatch = /^\/v1\/namespaces\/([^/]+)\/tables$/u.exec(url.pathname);
-      if (tablesMatch && method === 'POST') {
-        const namespace = decodeURIComponent(tablesMatch[1]);
-        const body = await readRestJson(request);
-        const name = namedString(body.name, 'table name');
-        const schema = plainObject(body.schema, 'schema');
-        const namespaces = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace);
-        if (!namespaces[0]) throw new RequestError('namespace does not exist', 404);
-        const metadata = { name, namespace: [namespace], schema };
-        await execute(this.ctx, `INSERT INTO ${TABLE_TABLE} (namespace, name, metadata_json) VALUES (?, ?, ?)`, namespace, name, canonicalJson(metadata));
-        return jsonResponse({ metadata });
+      if (tablesMatch) {
+        if (method === 'POST') return await this.#createTable(tablesMatch[1], request);
+        if (method === 'GET') return await this.#listTables(tablesMatch[1]);
       }
-      return new Response('not found', { status: 404 });
+      throw new RequestError('endpoint is not supported', 406, 'UnsupportedOperationException');
     } catch (error) {
-      return errorResponse(error, error instanceof RequestError ? error.status : 409);
+      return icebergErrorResponse(error);
     }
+  }
+
+  /** Lists direct child namespaces, optionally under the standard multipart parent. */
+  async #listNamespaces(url) {
+    const parentValue = url.searchParams.get('parent');
+    const parent = parentValue === null ? [] : namespaceFromPath(parentValue).segments;
+    const rows = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} ORDER BY name`);
+    const namespaces = rows
+      .map((row) => namespaceSegmentsFromKey(String(row.name)))
+      .filter((segments) => segments.length === parent.length + 1
+        && parent.every((segment, index) => segments[index] === segment));
+    return jsonResponse({ namespaces });
+  }
+
+  /** Creates one standard multipart Iceberg namespace in SQLite. */
+  async #createNamespace(request) {
+    const body = await readRestJson(request);
+    const namespace = namespaceValue(body.namespace);
+    const properties = stringMap(body.properties ?? {}, 'properties');
+    const existing = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (existing[0]) throw new RequestError('namespace already exists', 409, 'AlreadyExistsException');
+    await execute(this.ctx, `INSERT INTO ${NAMESPACE_TABLE} (name, properties_json) VALUES (?, ?)`, namespace.key, canonicalJson(properties));
+    return jsonResponse({ namespace: namespace.segments, properties });
+  }
+
+  /** Loads one namespace and its string properties from SQLite. */
+  async #loadNamespace(encodedNamespace) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const rows = await execute(this.ctx, `SELECT properties_json FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (!rows[0]) throw new RequestError('namespace does not exist', 404, 'NoSuchNamespaceException');
+    return jsonResponse({ namespace: namespace.segments, properties: JSON.parse(String(rows[0].properties_json)) });
+  }
+
+  /** Applies the Iceberg namespace property update contract in one serialized event. */
+  async #updateNamespaceProperties(encodedNamespace, request) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const rows = await execute(this.ctx, `SELECT properties_json FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (!rows[0]) throw new RequestError('namespace does not exist', 404, 'NoSuchNamespaceException');
+    const body = await readRestJson(request);
+    const removals = uniqueStringArray(body.removals ?? [], 'removals');
+    const updates = stringMap(body.updates ?? {}, 'updates');
+    const properties = JSON.parse(String(rows[0].properties_json));
+    const removed = [];
+    const missing = [];
+    for (const key of removals) {
+      if (Object.hasOwn(properties, key)) {
+        delete properties[key];
+        removed.push(key);
+      } else {
+        missing.push(key);
+      }
+    }
+    for (const [key, value] of Object.entries(updates)) properties[key] = value;
+    await execute(this.ctx, `UPDATE ${NAMESPACE_TABLE} SET properties_json = ? WHERE name = ?`, canonicalJson(properties), namespace.key);
+    return jsonResponse({ removed, updated: Object.keys(updates), missing });
+  }
+
+  /** Publishes initial Iceberg metadata through the host and stores its pointer in SQLite. */
+  async #createTable(encodedNamespace, request) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const namespaces = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (!namespaces[0]) throw new RequestError('namespace does not exist', 404, 'NoSuchNamespaceException');
+    const body = await readRestJson(request);
+    const name = icebergIdentifierPart(body.name, 'table name');
+    plainObject(body.schema, 'schema');
+    if (body['stage-create'] === true) {
+      throw new RequestError('staged create is not supported', 406, 'UnsupportedOperationException');
+    }
+    const existing = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace.key, name);
+    if (existing[0]) throw new RequestError('table already exists', 409, 'AlreadyExistsException');
+    const publication = await callIcebergCapability(this.env, {
+      operation: 'create-table',
+      warehouse: this.#config.warehouse,
+      namespace: namespace.segments,
+      request: body,
+    });
+    validateTablePublication(publication);
+    await execute(
+      this.ctx,
+      `INSERT INTO ${TABLE_TABLE} (namespace, name, metadata_location, metadata_json) VALUES (?, ?, ?, ?)`,
+      namespace.key,
+      name,
+      publication['metadata-location'],
+      canonicalJson(publication.metadata),
+    );
+    return jsonResponse({
+      'metadata-location': publication['metadata-location'],
+      metadata: publication.metadata,
+      config: {},
+    });
+  }
+
+  /** Lists all table identifiers in one namespace from SQLite. */
+  async #listTables(encodedNamespace) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const namespaces = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (!namespaces[0]) throw new RequestError('namespace does not exist', 404, 'NoSuchNamespaceException');
+    const rows = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? ORDER BY name`, namespace.key);
+    return jsonResponse({ identifiers: rows.map((row) => ({ namespace: namespace.segments, name: String(row.name) })) });
+  }
+
+  /** Registers existing immutable metadata as a new SQLite table head. */
+  async #registerTable(encodedNamespace, request) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const namespaces = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (!namespaces[0]) throw new RequestError('namespace does not exist', 404, 'NoSuchNamespaceException');
+    const body = await readRestJson(request);
+    const name = icebergIdentifierPart(body.name, 'table name');
+    const metadataLocation = locationString(body['metadata-location'], 'metadata-location');
+    const existing = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace.key, name);
+    if (existing[0] && body.overwrite !== true) throw new RequestError('table already exists', 409, 'AlreadyExistsException');
+    const publication = await callIcebergCapability(this.env, {
+      operation: 'register-table',
+      metadata_location: metadataLocation,
+    });
+    validateTablePublication(publication);
+    await execute(
+      this.ctx,
+      `INSERT INTO ${TABLE_TABLE} (namespace, name, metadata_location, metadata_json) VALUES (?, ?, ?, ?)
+       ON CONFLICT(namespace, name) DO UPDATE SET metadata_location = excluded.metadata_location, metadata_json = excluded.metadata_json`,
+      namespace.key,
+      name,
+      publication['metadata-location'],
+      canonicalJson(publication.metadata),
+    );
+    return jsonResponse({
+      'metadata-location': publication['metadata-location'],
+      metadata: publication.metadata,
+      config: {},
+    });
+  }
+
+  /** Applies a standard Iceberg table commit and advances only the SQLite head. */
+  async #commitTable(encodedNamespace, encodedName, request) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const name = tableNameFromPath(encodedName);
+    const rows = await execute(
+      this.ctx,
+      `SELECT metadata_location FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`,
+      namespace.key,
+      name,
+    );
+    if (!rows[0]) throw new RequestError('table does not exist', 404, 'NoSuchTableException');
+    const document = await readRestDocument(request);
+    const body = document.value;
+    const identifier = plainObject(body.identifier, 'identifier');
+    const requestedNamespace = namespaceValue(identifier.namespace);
+    if (requestedNamespace.key !== namespace.key || identifier.name !== name) {
+      throw new RequestError('table identifier does not match the request path');
+    }
+    if (!Array.isArray(body.requirements) || !Array.isArray(body.updates)) {
+      throw new RequestError('requirements and updates must be arrays');
+    }
+    const idempotencyKey = request.headers.get('idempotency-key');
+    const requestDigest = await digestHex(document.text);
+    if (idempotencyKey !== null) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(idempotencyKey)) {
+        throw new RequestError('Idempotency-Key must be a UUIDv7');
+      }
+      const prior = await execute(
+        this.ctx,
+        `SELECT request_digest, response_json FROM ${REST_LEDGER_TABLE} WHERE idempotency_key = ?`,
+        idempotencyKey,
+      );
+      if (prior[0]) {
+        if (String(prior[0].request_digest) !== requestDigest) {
+          throw new RequestError('Idempotency-Key was reused for a different request', 409, 'CommitFailedException');
+        }
+        return jsonResponse(JSON.parse(String(prior[0].response_json)));
+      }
+    }
+    const currentMetadataLocation = String(rows[0].metadata_location);
+    const publication = await callIcebergCapability(this.env, {
+      operation: 'commit-table',
+      current_metadata_location: currentMetadataLocation,
+      request_json: document.text,
+    });
+    validateTablePublication(publication);
+    await execute(
+      this.ctx,
+      `UPDATE ${TABLE_TABLE} SET metadata_location = ?, metadata_json = ? WHERE namespace = ? AND name = ? AND metadata_location = ?`,
+      publication['metadata-location'],
+      canonicalJson(publication.metadata),
+      namespace.key,
+      name,
+      currentMetadataLocation,
+    );
+    const response = {
+      'metadata-location': publication['metadata-location'],
+      metadata: publication.metadata,
+      config: {},
+    };
+    if (idempotencyKey !== null) {
+      await execute(
+        this.ctx,
+        `INSERT INTO ${REST_LEDGER_TABLE} (idempotency_key, request_digest, response_json) VALUES (?, ?, ?)`,
+        idempotencyKey,
+        requestDigest,
+        canonicalJson(response),
+      );
+    }
+    return jsonResponse(response);
+  }
+
+  /** Removes a table pointer without deleting immutable customer objects. */
+  async #dropTable(encodedNamespace, encodedName, url) {
+    if (url.searchParams.get('purgeRequested') === 'true') {
+      throw new RequestError('purging immutable table objects is not supported', 406, 'UnsupportedOperationException');
+    }
+    const namespace = namespaceFromPath(encodedNamespace);
+    const name = tableNameFromPath(encodedName);
+    const rows = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace.key, name);
+    if (!rows[0]) throw new RequestError('table does not exist', 404, 'NoSuchTableException');
+    await execute(this.ctx, `DELETE FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, namespace.key, name);
+    return new Response(null, { status: 204 });
+  }
+
+  /** Atomically moves one table identifier while retaining its immutable metadata pointer. */
+  async #renameTable(request) {
+    const body = await readRestJson(request);
+    const source = tableIdentifier(body.source, 'source');
+    const destination = tableIdentifier(body.destination, 'destination');
+    const destinationNamespace = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, destination.namespace.key);
+    if (!destinationNamespace[0]) throw new RequestError('destination namespace does not exist', 404, 'NoSuchNamespaceException');
+    const sourceRows = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, source.namespace.key, source.name);
+    if (!sourceRows[0]) throw new RequestError('source table does not exist', 404, 'NoSuchTableException');
+    const destinationRows = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? AND name = ?`, destination.namespace.key, destination.name);
+    if (destinationRows[0]) throw new RequestError('destination table already exists', 409, 'AlreadyExistsException');
+    await execute(
+      this.ctx,
+      `UPDATE ${TABLE_TABLE} SET namespace = ?, name = ? WHERE namespace = ? AND name = ?`,
+      destination.namespace.key,
+      destination.name,
+      source.namespace.key,
+      source.name,
+    );
+    return new Response(null, { status: 204 });
+  }
+
+  /** Drops an empty namespace from SQLite. */
+  async #dropNamespace(encodedNamespace) {
+    const namespace = namespaceFromPath(encodedNamespace);
+    const rows = await execute(this.ctx, `SELECT name FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    if (!rows[0]) throw new RequestError('namespace does not exist', 404, 'NoSuchNamespaceException');
+    const tables = await execute(this.ctx, `SELECT name FROM ${TABLE_TABLE} WHERE namespace = ? LIMIT 1`, namespace.key);
+    if (tables[0]) throw new RequestError('namespace is not empty', 409, 'NamespaceNotEmptyException');
+    await execute(this.ctx, `DELETE FROM ${NAMESPACE_TABLE} WHERE name = ?`, namespace.key);
+    return new Response(null, { status: 204 });
   }
 
   /**
@@ -229,28 +528,98 @@ export class Catalog extends DurableObject {
 
 export default { fetch };
 
-/** Reads one bounded REST JSON object. */
-async function readRestJson(request) {
+/** Reads one bounded REST JSON object while retaining exact integer lexemes. */
+async function readRestDocument(request) {
   const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength > MAX_AUTHORITY_RESPONSE_BYTES) throw new RequestError('REST request is too large', 413);
+  if (bytes.byteLength > MAX_REST_REQUEST_BYTES) throw new RequestError('REST request is too large', 413);
   try {
-    return plainObject(JSON.parse(textDecoder.decode(bytes)), 'request body');
+    const text = textDecoder.decode(bytes);
+    return { value: plainObject(JSON.parse(text), 'request body'), text };
   } catch (error) {
     if (error instanceof RequestError) throw error;
     throw new RequestError('request body must be valid JSON');
   }
 }
 
-/** Validates the one-segment namespace form supported by this product. */
-function namespaceName(value) {
-  if (!Array.isArray(value) || value.length !== 1) throw new RequestError('namespace must contain one segment');
-  return namedString(value[0], 'namespace');
+/** Reads one bounded REST JSON object when raw numeric lexemes are not forwarded. */
+async function readRestJson(request) {
+  return (await readRestDocument(request)).value;
+}
+
+/** Validates a standard non-empty multipart namespace value. */
+function namespaceValue(value) {
+  if (!Array.isArray(value) || value.length === 0) throw new RequestError('namespace must be a non-empty array');
+  const segments = value.map((segment) => icebergIdentifierPart(segment, 'namespace segment'));
+  return { segments, key: segments.join(NAMESPACE_SEPARATOR) };
+}
+
+/** Decodes the Iceberg unit-separator namespace path representation. */
+function namespaceFromPath(value) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    throw new RequestError('namespace path is not valid percent encoding');
+  }
+  return namespaceValue(decoded.split(NAMESPACE_SEPARATOR));
+}
+
+/** Decodes and validates one percent-encoded Iceberg table name. */
+function tableNameFromPath(value) {
+  try {
+    return icebergIdentifierPart(decodeURIComponent(value), 'table name');
+  } catch (error) {
+    if (error instanceof RequestError) throw error;
+    throw new RequestError('table path is not valid percent encoding');
+  }
+}
+
+/** Validates a standard Iceberg table identifier object. */
+function tableIdentifier(value, field) {
+  const object = plainObject(value, field);
+  return {
+    namespace: namespaceValue(object.namespace),
+    name: icebergIdentifierPart(object.name, `${field} table name`),
+  };
+}
+
+/** Validates one Iceberg identifier component without imposing SQL-name syntax. */
+function icebergIdentifierPart(value, field) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 255
+      || value.includes(NAMESPACE_SEPARATOR) || /[\u0000-\u001e\u007f]/u.test(value)) {
+    throw new RequestError(`${field} must be a non-empty bounded identifier`);
+  }
+  return value;
+}
+
+/** Splits one canonical SQLite namespace key. */
+function namespaceSegmentsFromKey(key) {
+  return key.split(NAMESPACE_SEPARATOR);
 }
 
 /** Validates a plain JSON object. */
 function plainObject(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestError(`${field} must be an object`);
   return value;
+}
+
+/** Validates an Iceberg string-to-string property map. */
+function stringMap(value, field) {
+  const object = plainObject(value, field);
+  for (const [key, item] of Object.entries(object)) {
+    if (typeof item !== 'string') throw new RequestError(`${field}.${key} must be a string`);
+  }
+  return object;
+}
+
+/** Validates one duplicate-free array of strings. */
+function uniqueStringArray(value, field) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new RequestError(`${field} must be an array of strings`);
+  }
+  const unique = [...new Set(value)];
+  if (unique.length !== value.length) throw new RequestError(`${field} must not contain duplicates`);
+  return unique;
 }
 
 /**
@@ -261,25 +630,27 @@ export class RequestError extends Error {
    * Creates a request validation failure.
    * @param {string} message
    * @param {number} status
+   * @param {string} type
    */
-  constructor(message, status = 400) {
+  constructor(message, status = 400, type = 'BadRequestException') {
     super(message);
     this.name = 'RequestError';
     this.status = status;
+    this.type = type;
   }
 }
 
 /**
- * Marks an authority call or receipt that cannot confirm a commit.
+ * Marks a runtime proposal that cannot prove its immutable writes.
  */
-class AuthorityCommitError extends Error {
+class RuntimeProposalError extends Error {
   /**
-   * Creates an authority failure.
+   * Creates a runtime proposal failure.
    * @param {string} message
    */
   constructor(message) {
     super(message);
-    this.name = 'AuthorityCommitError';
+    this.name = 'RuntimeProposalError';
   }
 }
 
@@ -343,6 +714,11 @@ async function createTables(ctx) {
     rows_committed INTEGER NOT NULL,
     receipt_json TEXT NOT NULL
   )`);
+  await execute(ctx, `CREATE TABLE IF NOT EXISTS ${REST_LEDGER_TABLE} (
+    idempotency_key TEXT PRIMARY KEY,
+    request_digest TEXT NOT NULL,
+    response_json TEXT NOT NULL
+  )`);
   await execute(ctx, `CREATE TABLE IF NOT EXISTS ${NAMESPACE_TABLE} (
     name TEXT PRIMARY KEY,
     properties_json TEXT NOT NULL
@@ -350,6 +726,7 @@ async function createTables(ctx) {
   await execute(ctx, `CREATE TABLE IF NOT EXISTS ${TABLE_TABLE} (
     namespace TEXT NOT NULL,
     name TEXT NOT NULL,
+    metadata_location TEXT,
     metadata_json TEXT NOT NULL,
     PRIMARY KEY (namespace, name)
   )`);
@@ -504,15 +881,68 @@ async function parseCommitRequest(request, config) {
   };
 }
 
+/** Calls the host capability for one bounded Iceberg metadata publication. */
+async function callIcebergCapability(env, payload) {
+  const capability = env.ICEBERG_COMMIT;
+  if (!capability || typeof capability.fetch !== 'function') {
+    throw new RequestError('Iceberg publication capability is unavailable', 503, 'ServiceUnavailableException');
+  }
+  let response;
+  try {
+    response = await capability.fetch(new Request(`https://verglas.internal${CATALOG_COMMIT_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: canonicalJson(payload),
+    }));
+  } catch (error) {
+    throw new RequestError(`Iceberg publication failed: ${errorMessage(error)}`, 503, 'ServiceUnavailableException');
+  }
+  if (!response) throw new RequestError('Iceberg publication returned no response', 503, 'ServiceUnavailableException');
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > MAX_RUNTIME_RESPONSE_BYTES) {
+    throw new RequestError('Iceberg publication response is too large', 503, 'ServiceUnavailableException');
+  }
+  let decoded;
+  try {
+    decoded = plainObject(JSON.parse(textDecoder.decode(bytes)), 'Iceberg publication response');
+  } catch (error) {
+    if (response.status >= 200 && response.status < 300) {
+      throw new RequestError('Iceberg publication response is not valid JSON', 503, 'ServiceUnavailableException');
+    }
+    decoded = {};
+  }
+  if (response.status < 200 || response.status >= 300) {
+    const message = typeof decoded.error?.message === 'string'
+      ? decoded.error.message
+      : `Iceberg publication failed with HTTP ${response.status}`;
+    if (response.status === 400) throw new RequestError(message, 400, 'BadRequestException');
+    if (response.status === 409) throw new RequestError(message, 409, 'CommitFailedException');
+    throw new RequestError(message, 503, 'ServiceUnavailableException');
+  }
+  return decoded;
+}
+
+/** Validates host proposal fields before SQLite installs the Catalog head. */
+function validateTablePublication(publication) {
+  if (typeof publication['metadata-location'] !== 'string' || publication['metadata-location'].trim() === '') {
+    throw new RequestError('Iceberg publication response is missing metadata-location', 503, 'ServiceUnavailableException');
+  }
+  const metadata = plainObject(publication.metadata, 'Iceberg publication metadata');
+  if (!Number.isInteger(metadata['format-version']) || typeof metadata['table-uuid'] !== 'string') {
+    throw new RequestError('Iceberg publication response contains invalid table metadata', 503, 'ServiceUnavailableException');
+  }
+}
+
 /**
- * Calls the sole injected authority with a deterministic internal request and
- * accepts only a receipt matching the requested identity and row count.
+ * Requests immutable Sink files from the sole runtime capability and accepts
+ * only a proposal matching the requested identity and row count.
  * @param {Record<string, unknown>} env
  * @param {object} config
  * @param {object} commit
+ * @param {string|null} currentMetadataLocation
  * @returns {Promise<object>}
  */
-async function commitToAuthority(env, config, commit) {
+async function requestSinkProposal(env, config, commit, currentMetadataLocation) {
   const headers = new Headers([
     ['content-type', 'application/json'],
     ['x-verglas-sink-id', config.sinkId],
@@ -524,7 +954,11 @@ async function commitToAuthority(env, config, commit) {
   const request = new Request(`https://verglas.internal${CATALOG_COMMIT_PATH}`, {
     method: 'POST',
     headers,
-    body: commit.canonicalPayload,
+    body: canonicalJson({
+      operation: 'commit-sink-batch',
+      current_metadata_location: currentMetadataLocation,
+      request: JSON.parse(commit.canonicalPayload),
+    }),
   });
 
   let response;
@@ -533,32 +967,38 @@ async function commitToAuthority(env, config, commit) {
     if (!capability || typeof capability.fetch !== 'function') throw new Error('ICEBERG_COMMIT is not configured');
     response = await capability.fetch(request);
   } catch (error) {
-    throw new AuthorityCommitError(`Catalog authority request failed: ${errorMessage(error)}`);
+    throw new RuntimeProposalError(`Runtime proposal request failed: ${errorMessage(error)}`);
   }
   if (!response || response.status < 200 || response.status >= 300) {
-    throw new AuthorityCommitError(`Catalog authority did not confirm batch ${commit.batchId}: HTTP ${response?.status ?? 'unknown'}`);
+    throw new RuntimeProposalError(`Runtime proposal did not confirm batch ${commit.batchId}: HTTP ${response?.status ?? 'unknown'}`);
   }
   const receiptBytes = new Uint8Array(await response.arrayBuffer());
-  if (receiptBytes.byteLength > MAX_AUTHORITY_RESPONSE_BYTES) {
-    throw new AuthorityCommitError('Catalog authority receipt exceeds its hard response ceiling');
+  if (receiptBytes.byteLength > MAX_RUNTIME_RESPONSE_BYTES) {
+    throw new RuntimeProposalError('Runtime proposal receipt exceeds its hard response ceiling');
   }
   let receipt;
   try {
     receipt = JSON.parse(textDecoder.decode(receiptBytes));
   } catch (error) {
-    throw new AuthorityCommitError(`Catalog authority receipt is not valid JSON: ${errorMessage(error)}`);
+    throw new RuntimeProposalError(`Runtime proposal receipt is not valid JSON: ${errorMessage(error)}`);
   }
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
-    throw new AuthorityCommitError('Catalog authority receipt must be a JSON object');
+    throw new RuntimeProposalError('Runtime proposal receipt must be a JSON object');
   }
   if (receipt.committed !== true || receipt.batch_id !== commit.batchId || receipt.file_id !== commit.fileId) {
-    throw new AuthorityCommitError('Catalog authority receipt did not confirm the requested batch and file');
+    throw new RuntimeProposalError('Runtime proposal receipt did not confirm the requested batch and file');
   }
   if (!Number.isSafeInteger(receipt.rows_committed) || receipt.rows_committed !== countRows(commit.canonicalPayload)) {
-    throw new AuthorityCommitError('Catalog authority receipt has the wrong committed row count');
+    throw new RuntimeProposalError('Runtime proposal receipt has the wrong committed row count');
   }
   if (typeof receipt.snapshot_id !== 'string' || receipt.snapshot_id.trim() === '') {
-    throw new AuthorityCommitError('Catalog authority receipt is missing snapshot_id');
+    throw new RuntimeProposalError('Runtime proposal receipt is missing snapshot_id');
+  }
+  if (typeof receipt.metadata_location !== 'string' || receipt.metadata_location.trim() === '') {
+    throw new RuntimeProposalError('Runtime proposal receipt is missing metadata_location');
+  }
+  if (!receipt.metadata || typeof receipt.metadata !== 'object' || Array.isArray(receipt.metadata)) {
+    throw new RuntimeProposalError('Runtime proposal receipt is missing Iceberg table metadata');
   }
   return receipt;
 }
@@ -588,6 +1028,34 @@ async function loadLedgerEntry(ctx, batchId) {
   return rows.length === 0 ? undefined : rows[0];
 }
 
+/** Installs the proposed table pointer and Sink receipt in the host-owned event transaction. */
+async function persistCatalogCommit(ctx, config, commit, runtimeProposal, receipt) {
+  await execute(
+    ctx,
+    `INSERT OR IGNORE INTO ${NAMESPACE_TABLE} (name, properties_json) VALUES (?, '{}')`,
+    config.namespace,
+  );
+  await execute(
+    ctx,
+    `INSERT INTO ${TABLE_TABLE} (namespace, name, metadata_location, metadata_json) VALUES (?, ?, ?, ?)
+     ON CONFLICT(namespace, name) DO UPDATE SET metadata_location = excluded.metadata_location, metadata_json = excluded.metadata_json`,
+    config.namespace,
+    config.table,
+    runtimeProposal.metadata_location,
+    canonicalJson(runtimeProposal.metadata),
+  );
+  await execute(
+    ctx,
+    `INSERT INTO ${LEDGER_TABLE} (batch_id, payload_digest, file_id, snapshot_id, rows_committed, receipt_json) VALUES (?, ?, ?, ?, ?, ?)`,
+    commit.batchId,
+    commit.payloadDigest,
+    commit.fileId,
+    receipt.snapshot_id,
+    receipt.rows_committed,
+    JSON.stringify(receipt),
+  );
+}
+
 /**
  * Determines whether a method/path pair is a standard public Iceberg REST
  * endpoint. Internal Catalog controls intentionally do not match this set.
@@ -600,18 +1068,18 @@ export function isPublicRestRequest(method, pathname) {
   const rawSegments = pathname.split('/');
   if (rawSegments[0] !== '' || rawSegments.slice(1).some((segment) => segment.length === 0)) return false;
   const segments = rawSegments.slice(1);
-  if (segments.length < 2 || segments[0] !== 'v1' || segments[1] !== 'namespaces') return false;
+  if (segments.length < 2 || segments[0] !== 'v1') return false;
+  if (segments.length === 3 && segments[1] === 'tables' && segments[2] === 'rename') {
+    return method === 'POST';
+  }
+  if (segments[1] !== 'namespaces') return false;
   if (segments.length === 2) return method === 'GET' || method === 'POST';
   if (segments.length === 3) return method === 'GET' || method === 'DELETE';
   if (segments.length === 4 && segments[3] === 'properties') return method === 'POST';
   if (segments.length === 4 && segments[3] === 'tables') return method === 'GET' || method === 'POST';
-  if (segments.length === 4 && segments[3] === 'views') return method === 'GET' || method === 'POST';
   if (segments.length === 4 && segments[3] === 'register') return method === 'POST';
-  if (segments.length === 5 && (segments[3] === 'tables' || segments[3] === 'views')) {
+  if (segments.length === 5 && segments[3] === 'tables') {
     return method === 'GET' || method === 'HEAD' || method === 'DELETE' || method === 'POST';
-  }
-  if (segments.length === 6 && (segments[3] === 'tables' || segments[3] === 'views') && segments[5] === 'rename') {
-    return method === 'POST';
   }
   return false;
 }
@@ -772,4 +1240,11 @@ function jsonResponse(value, status = 200) {
  */
 function errorResponse(error, status) {
   return jsonResponse({ error: errorMessage(error) }, status);
+}
+
+/** Creates the standard Iceberg REST error envelope. */
+function icebergErrorResponse(error) {
+  const status = error instanceof RequestError ? error.status : 500;
+  const type = error instanceof RequestError ? error.type : 'InternalServerError';
+  return jsonResponse({ error: { message: errorMessage(error), type, code: status } }, status);
 }
