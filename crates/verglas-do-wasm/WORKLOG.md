@@ -12,3 +12,4 @@
 - #171: Threaded `WorkerBindings` through every gated WorkerRuntime event so the runtime endpoint can route cross-object calls through its per-socket host channel without retaining a compatibility alias. (Replace #0 with the tracking issue number before release.)
 - #0: Updated the frozen WIT for PP4: Arrow IPC SQL was deleted, JSON-row SQL is the sole relational surface, and `storage.stream-send` stages logical records in the current event transaction. WorkerHost and stateless WorkerPool now implement the narrowed capability without a compatibility verb.
 - #171: Updated resident-host diagnostics to name the final `verglas-runtime` executable after the old worker daemon name was removed. The WASM capability model and no-network isolation contract are unchanged.
+- #171: Updated the service-world source comment to identify `verglas-runtime` as the sole host. The WIT surface and capability boundaries are unchanged.

@@ -1,7 +1,6 @@
 /**
  * Generated WIT capability bindings for the Cloudflare Durable Object shim.
- * The core adapter sends direct structured calls; it never builds engine
- * envelopes or uses a text-command transport.
+ * The core adapter maps structured calls directly to WIT capability imports.
  */
 
 import {

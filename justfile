@@ -15,8 +15,3 @@ test:
 lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
-
-# Ceph s3-tests conformance: full suite against the runtime over MinIO.
-# Pass extra flags through, e.g. `just s3-tests --smoke` or `just s3-tests --debug`.
-s3-tests *ARGS:
-    ./tests/s3-conformance/run.sh {{ARGS}}

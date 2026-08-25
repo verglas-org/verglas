@@ -478,3 +478,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   listener/catalog/cluster/write-back config, disk budget helpers, and their
   obsolete integration tests.
 - #171: Deleted the final `node`, `peer`, and rendezvous-ring modules and their tests. Cache identity documentation now describes only immutable binding/version/geometry isolation; no membership, ownership, donor, or peer-fetch seam remains.
+- #171: Corrected retained configuration and memory-grant module language to name the single runtime host rather than deleted process roles. The change is documentation-only and keeps product deployment settings out of shared origin/cache configuration.

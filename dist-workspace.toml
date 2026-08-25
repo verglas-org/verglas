@@ -3,9 +3,9 @@ members = ["cargo:."]
 
 # Config for 'dist' (cargo-dist): the cross-platform prebuilt-binary release
 # pipeline. `git tag vX.Y.Z && git push --tags` triggers .github/workflows/
-# release.yml, which builds every target below, assembles one archive per
-# engine roles, generates the installers, and publishes a
-# GitHub Release with checksums. No crates.io publishing: the workspace patches
+# release.yml, which builds every target below, assembles one archive per target,
+# generates the installers, and publishes a GitHub Release with checksums. No
+# crates.io publishing: the workspace patches
 # iceberg from the verglas-org/iceberg-rust fork ([patch.crates-io]), so
 # distribution is GitHub Releases only.
 [dist]
@@ -13,10 +13,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backend that runs the release workflow.
 ci = "github"
-# Target platforms. musl is intentionally NOT built: aws-lc-sys (S3 TLS) and
-# several native deps add musl-static friction. Linux ships glibc (gnu) instead,
-# which covers the mainstream distros. windows-msvc is the real compile gate for
-# the cfg-audited unix-only paths (service install, SIGHUP reload, process groups).
+# Target platforms. musl is intentionally NOT built because the native TLS and
+# object-store dependencies require a glibc-based Linux target. Linux ships glibc
+# (gnu), which covers the mainstream distros.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -30,11 +29,7 @@ checksum = "sha256"
 pr-run-mode = "skip"
 # Publish the TypeScript SDK after every target build is green.
 publish-jobs = ["./publish-sdk"]
-# Link the DYNAMIC MSVC CRT on windows. cargo-dist defaults to +crt-static,
-# but the ONNX Runtime objects (fastembed -> ort, prebuilt) are compiled
-# against the dynamic CRT — static linking fails with LNK2001 unresolved
-# __imp_* symbols (seen on the v0.1.0 run). The UCRT ships with Windows 10+,
-# so dynamic is safe for users.
+# Link the dynamic MSVC CRT for the Windows native dependencies.
 msvc-crt-static = false
 # Releases publish to this same public repo (verglas-org/verglas). No separate
 # releases-only override.

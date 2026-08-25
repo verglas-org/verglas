@@ -7,7 +7,7 @@ icon: "diagram-project"
 This page is the source of truth for Verglas hosted compute and ingestion. The
 platform has exactly six products. Each product is either tenant Worker code or
 a prebuilt system deployment made from the same Worker and Durable Object
-primitives. There is no separate job runtime, queue engine, database runtime,
+primitives. There is no separate job runtime, queue service, database runtime,
 or lakehouse path hidden behind these products.
 
 1. **Worker** — stateless public ingress.
@@ -98,25 +98,25 @@ or push a DO database. The cloud provisions a distinct remote URL/token for
 each DO, and its sync ingress validates the current placement lease before
 forwarding a push. A takeover revokes the prior writer before the new owner
 pulls and serves events. This is a fencing/authentication wrapper around Turso,
-not a second SQL commit or storage engine. The complete Turso sidecar set is
+not a second SQL commit or storage authority. The complete Turso sidecar set is
 kept together on local NVMe; copying a local directory between DO identities is
 forbidden because it also copies the persisted sync-client identity.
 
 Reserved Turso tables implement byte KV, the single alarm, WebSocket
 attachments, event sequencing, and the optional Stream outbox. Tenant SQL uses
 the same Turso transaction and supports ordinary SQLite-compatible DDL and DML.
-The host converts rows to the existing WIT JSON-row boundary; Arrow mutation
-envelopes are not part of the DO commit protocol.
+The host converts rows to the WIT JSON-row boundary; no alternate mutation
+format is part of the DO commit protocol.
 
-The following custom engine mechanisms are removed rather than retained as
-alternate paths:
+The following alternate mechanisms are removed rather than retained as
+fallback paths:
 
-- the custom SQLite pager and replica store;
-- DataFusion-backed transactional SQL and table providers;
-- canonical Arrow transaction envelopes;
+- a custom SQLite pager or secondary state store;
+- an alternate SQL provider or table layer;
+- alternate transaction envelopes;
 - DO-owned vector/graph mutation domains;
 - direct DO-to-Iceberg offload and archive batching;
-- S3 CAS as the DO SQL commit authority.
+- an object-store write path as the DO SQL commit authority.
 
 Lease fencing still protects placement and execution. It does not invent a
 second database commit protocol around Turso.
@@ -193,9 +193,8 @@ WHERE ...;
 The implemented compatibility surface is stateless SQL: projection, aliases,
 expressions, filters, `WITH`, subqueries, documented scalar functions, and one
 `UNNEST` per `SELECT`. DDL, `UPDATE`, `DELETE`, joins, aggregates, windows, and
-other stateful transforms are rejected. The transform engine may use
-DataFusion; it is isolated to the Pipeline product and is not a DO storage or
-commit engine.
+other stateful transforms are rejected. The Pipeline evaluator is isolated to
+this product and is not a DO storage or commit authority.
 
 The Pipeline DO owns an independent next-sequence cursor for each input Stream,
 its current batch, retry state, and immutable SQL digest. It reads contiguous
@@ -252,10 +251,10 @@ Verglas catalog and object-storage libraries. Pipelines reach it only through
 Sink bindings. Query clients use the REST Worker.
 
 The catalog product retains the existing Iceberg domain code, authorization,
-REST types, Parquet helpers, and cache integration. It does not retain the old
-DO engine's direct `IcebergCommitter`, `VerifiedIcebergArchive`, or mutation
-envelope path. Catalog state and Sink delivery state remain separate Durable
-Objects joined by deterministic Iceberg batch identities.
+REST types, Parquet helpers, and cache integration. It does not give ordinary
+DOs a direct commit, archive, or alternate mutation path. Catalog state and Sink
+delivery state remain separate Durable Objects joined by deterministic Iceberg
+batch identities.
 
 ## Management and observability
 
@@ -304,8 +303,8 @@ deleted, ignored, or stripped of assertions.
   executes KV, alarm, attachments, and CREATE/INSERT/UPDATE/DELETE/SELECT through
   one embedded Turso event transaction. State survives process and machine-data
   cache loss through the configured Turso durability service. No custom pager,
-  DataFusion transaction provider, Arrow mutation envelope, or direct lake
-  offloader remains in the runtime dependency graph.
+  alternate SQL provider, alternate mutation format, or direct lake offloader
+  remains in the runtime dependency graph.
 - **PP3 — Stream isolation.** `send(records)` and authenticated HTTP ingestion
   durably append ordered JSON and survive restart. Two Pipelines consume the
   same Stream independently. Static dependency and behavior tests prove the
@@ -329,7 +328,7 @@ deleted, ignored, or stripped of assertions.
 - **PP8 — six-product and runtime closure.** Deployment and architecture
   inventories expose exactly Worker, Durable Object, Stream, Pipeline, Sink,
   and Catalog. Every system resource is implemented as a prebuilt Worker/DO
-  deployment on `verglas-runtime`. Retired execution and storage engines are
+  deployment on `verglas-runtime`. Retired execution and storage paths are
   absent, and ordinary Durable Objects have no direct Iceberg publication path.
 - **PP9 — Cloudflare-shaped management contract.** Verglas manifests and
   provisioning inputs support the Cloud control plane's create/list/get/delete

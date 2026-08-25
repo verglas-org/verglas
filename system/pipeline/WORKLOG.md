@@ -16,3 +16,7 @@
   failed for the expected reasons (`expected SELECT, received WITH`, unsupported
   `UNNEST`, and unsupported `[` syntax) before the parser/evaluator changes
   turned the suite green.
+
+- #171: Removed the obsolete broader-runtime comparison from the Pipeline README. The
+  documented SQL boundary now describes the implemented evaluator directly and
+  keeps the product contract independent of retired query-engine terminology.

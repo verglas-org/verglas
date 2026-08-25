@@ -322,4 +322,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #171: Removed the final write-back fragment field from the S3 metrics fixture after deleting that retired distributed-storage metric family from core.
 - #s3-cleanup: Added a static public-surface guard proving semantic mutation
   routes and dispatch remain absent after the passthrough-only reduction.
+- #171: Deleted the orphaned generated S3 Vector service model after removing its routes and Rust types. The retained crate contains only the S3-compatible object surface used by runtime infrastructure.
 

@@ -30,7 +30,7 @@ path.
 ## SQL target and gap
 
 The implemented target is intentionally a small stateless SQL evaluator, not a
-claim of full DataFusion or Cloudflare function parity. It accepts:
+claim of full SQL or Cloudflare function parity. It accepts:
 
 ```sql
 INSERT INTO sink_name
@@ -71,8 +71,8 @@ The remaining gap is deliberate: joins and comma joins, aggregates, windows,
 functions, double-quoted identifiers, and unknown functions are rejected before
 serving. CTEs are non-recursive and each derived table has one relation. Records
 are JSON values; projections produce JSON object rows. The evaluator uses
-JavaScript numeric and boolean semantics for this small target, not full
-DataFusion or Cloudflare function parity.
+JavaScript numeric and boolean semantics for this small target, not full SQL or
+Cloudflare function parity.
 
 ## Binding protocol
 

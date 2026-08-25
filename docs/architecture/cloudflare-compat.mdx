@@ -19,7 +19,7 @@ this page does not imply that an unmarked row below has shipped.
    a working copy. One remote Turso database belongs to each DO, and an external
    lease-fenced sync ingress validates the current placement before forwarding a
    Turso push. The fence protects placement and synchronization; it is not a
-   second SQL commit engine. Worker code reaches a DO only through env bindings:
+   second SQL commit authority. Worker code reaches a DO only through env bindings:
    `env.NS.idFromName(name)`, `env.NS.get(id)`, and `stub.fetch(request)`.
 
 **The spec is Cloudflare's; the SDK is ours.** Cloudflare-style project code

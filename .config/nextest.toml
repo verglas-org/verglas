@@ -1,23 +1,9 @@
-# Tests that can run without secrets and external services.
+# Workspace test profiles. All default tests use in-process fixtures; opt-in
+# external-service tests are not part of the normal profile.
 [profile.default]
-default-filter = """
-    not test(::aws_integration_tests::)
-    and not test(::aws_kms_integration_tests::)
-    and not test(::azure_integration_tests::)
-    and not test(::azure_system_credentials_integration_tests::)
-    and not test(::onelake_integration_tests::)
-    and not test(::gcs_integration_tests::)
-    and not test(::gcs_hns_integration_tests::)
-    and not test(::gcp_system_credentials_integration_tests::)
-    and not test(::kv2_integration_tests::)
-    and not test(::minio_integration_tests::)
-    and not test(::openfga_integration_tests::)
-    and not test(::r2_integration_tests::)
-    and not test(::oss_integration_tests::)
-"""
-
-[profile.debug]
-default-filter = "test(::gcp_system_credentials_integration_tests::)"
+failure-output = "immediate-final"
+fail-fast = false
+retries = 0
 
 [profile.ci]
 default-filter = "all()"
@@ -25,26 +11,5 @@ failure-output = "immediate-final"
 fail-fast = false
 retries = 0
 
-[profile.ci.junit] # this can be some other profile, too
-path = "junit.xml"
-
-# Can require external services but no secrets.
-[profile.ci_no_secrets]
-default-filter = """
-    not test(::aws_integration_tests::)
-    and not test(::aws_kms_integration_tests::)
-    and not test(::azure_integration_tests::)
-    and not test(::azure_system_credentials_integration_tests::)
-    and not test(::onelake_integration_tests::)
-    and not test(::gcs_integration_tests::)
-    and not test(::gcs_hns_integration_tests::)
-    and not test(::gcp_system_credentials_integration_tests::)
-    and not test(::r2_integration_tests::)
-    and not test(::oss_integration_tests::)
-"""
-failure-output = "immediate-final"
-fail-fast = false
-retries = 0
-
-[profile.ci_no_secrets.junit] # this can be some other profile, too
+[profile.ci.junit]
 path = "junit.xml"

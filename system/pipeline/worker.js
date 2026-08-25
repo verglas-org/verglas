@@ -494,7 +494,7 @@ function assembleBatch(config, sourceRecords) {
 
 /**
  * Evaluates one statement against one Stream record. CTE and derived-table
- * rows remain ordinary JSON objects, so no state or second storage engine is
+ * rows remain ordinary JSON objects, so no state or second storage authority is
  * introduced by the relational syntax.
  * @param {object} statement
  * @param {unknown} record

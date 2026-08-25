@@ -2,8 +2,8 @@
 //! (`GetObject`/`HeadObject`) on top of the [`ObjectRead`] interface and the write
 //! surface (`PutObject`, `DeleteObject`(s), `CopyObject`, the multipart
 //! lifecycle) on top of the [`ObjectWrite`] interface, exposing the whole thing as
-//! an axum router the server can bind to `listen.s3_port`. s3s owns request
-//! parsing, error XML rendering, and status codes; this module owns the
+//! an axum router for an owning HTTP host to mount. s3s owns request parsing,
+//! error XML rendering, and status codes; this module owns the
 //! mapping between S3 semantics and the interfaces — including the write path's
 //! ordering invariant: backend durable, then invalidation, then (and only
 //! then) the client ack.

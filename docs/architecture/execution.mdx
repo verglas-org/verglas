@@ -17,7 +17,7 @@ its bindings are its authority. A **Durable Object** is a named stateful Worker
 class with strictly serialized events and one embedded Turso `0.7.2` database.
 The local database is a working copy of one remote Turso database dedicated to
 that DO. An external lease-fenced sync ingress validates placement before
-forwarding `push()`; it is not a second SQL commit engine.
+forwarding `push()`; it is not a second SQL commit authority.
 
 A DO event commits KV/SQL/alarm/attachment state in one Turso transaction. The
 host confirms the remote push before releasing event effects. Selected committed
@@ -25,10 +25,9 @@ changes may also create transactional outbox rows for a Stream. The Stream
 deduplicates `(object-id, event-sequence, record-index)` identities, so a crash
 between Stream confirmation and the delivered mark causes an idempotent resend.
 
-A DO has no custom SQLite pager, DataFusion transaction provider, Arrow mutation
-envelope, lease-fenced S3 CAS SQL authority, direct Iceberg offloader, or
-vector/graph mutation domain. DataFusion may be used inside a Pipeline's
-stateless SQL transform only; it is not part of DO storage.
+A DO has no custom SQLite pager, alternate SQL provider, alternate mutation or
+object-store authority, direct Iceberg offloader, or vector/graph mutation
+domain. The Pipeline's stateless SQL transform is separate from DO storage.
 
 ## Prebuilt data products
 

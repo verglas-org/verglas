@@ -1,6 +1,6 @@
 // The verglas:do world: the ABI every Durable Object Worker component targets.
 //
-// Exports are the event surface the host (verglasd) invokes; imports are the
+// Exports are the event surface the host (verglas-runtime) invokes; imports are the
 // capabilities the host grants. Storage is bound in-process to the Turso-backed
 // DO runtime, never over a network hop.
 

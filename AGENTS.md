@@ -24,8 +24,8 @@ Things that are easy to get wrong:
 
 - **The Catalog is a Worker/Durable Object product.** Its durable product
   state is held by Turso, and its privileged Iceberg commit capability is
-  host-mediated by `verglas-runtime`. There is no clustered catalog process,
-  consensus plane, or standalone catalog daemon in this repository.
+  host-mediated by `verglas-runtime`. It has no separate catalog service or
+  consensus layer in this repository.
 - **`.cargo/config.toml` sets `--cfg tracing_unstable` for the whole
   workspace.** It gates `tracing`/`tracing-subscriber`'s `valuable` feature.
   Rustflags set in the environment *replace* that table rather than merging, so

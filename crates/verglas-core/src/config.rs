@@ -1,8 +1,8 @@
 //! Configuration values shared by the origin backend and byte cache.
 //!
 //! This module contains only settings that configure retained origin access and
-//! local Foyer caching. Listener, admin, cluster, and catalog process settings are
-//! intentionally not represented here.
+//! local Foyer caching. Network entrypoints and product deployment settings live
+//! with their owning host.
 
 use std::path::PathBuf;
 

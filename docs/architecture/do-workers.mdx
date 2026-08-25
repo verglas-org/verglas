@@ -33,9 +33,9 @@ Worker ── env bindings ──┬── Durable Object
 The sync ingress validates the current placement lease before forwarding a
 Turso push. The lease fences who may open or push a DO database; it does not
 create a second SQL authority. The DO runtime has no custom SQLite pager,
-DataFusion transaction provider, Arrow mutation envelope, direct Iceberg
-offloader, or vector/graph mutation domain. DataFusion, if used, belongs to a
-Pipeline's stateless SQL transform and is not DO storage.
+alternate SQL provider, mutation envelope, direct Iceberg offloader, or
+vector/graph mutation domain. A Pipeline's stateless SQL evaluator is separate
+from DO storage.
 
 ## The ABI
 
@@ -59,8 +59,8 @@ component contract; the following surfaces describe its target behavior:
 Reserved Turso tables hold byte KV, the single alarm, WebSocket attachments,
 event sequencing, and optional Stream outbox rows. Tenant SQL uses the same
 Turso transaction and the SQLite-compatible DDL/DML surface. The host exposes
-rows through the WIT JSON-row boundary; Arrow mutation envelopes are not part of
-DO commit or publication.
+rows through the WIT JSON-row boundary; no alternate mutation envelope is part
+of DO commit or publication.
 
 ## Event execution: one at a time, gated
 

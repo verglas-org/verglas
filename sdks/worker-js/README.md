@@ -129,7 +129,7 @@ The component imports only:
 It exports the Worker `fetch` interface and the Durable Object `handler`
 interface. ComponentizeJS is invoked with `--disable=all`; the build requests no
 WASI imports. The storage adapter is a sandboxed guest adapter, unlike the
-trusted TypeScript SDK transport that can encode canonical engine envelopes.
+trusted TypeScript SDK transport that speaks its HTTP contract.
 
 ## Local checks
 

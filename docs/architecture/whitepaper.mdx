@@ -106,7 +106,7 @@ A Sink does not transform records or advance Pipeline cursors.
 Catalog owns the Iceberg API, immutable deployment configuration, namespace and
 table state, and confirmed commit ledger. That state is held in the Catalog
 Durable Object's Turso database. Public catalog requests terminate at the
-Catalog product rather than an infrastructure HTTP daemon.
+Catalog product rather than a separate infrastructure HTTP service.
 
 For an Iceberg data commit, Catalog validates the declared Sink, destination,
 batch identity, and expected table state. It then invokes the runtime's private
@@ -164,17 +164,17 @@ transactional outbox, and clean event-endpoint shutdown.
 `verglas-runtime` is the only resident execution binary. It embeds Wasmtime,
 opens Turso, dispatches serialized events, maintains local Foyer stores, accesses
 the configured origin, and serves reserved host capabilities. There is no other
-serving daemon or binary alias.
+serving runtime or binary alias.
 
 Firecracker remains the production isolation boundary. Local process provisioning
 implements the same celld contract for development and hermetic tests.
 
 ## 5. Durable Object transactions
 
-At activation, the runtime opens the local Turso replica with an explicit remote
-URL and token file. Production startup never treats a local-only database as a
-successful substitute. The runtime verifies the component before accepting an
-event.
+At activation, the runtime opens the local Turso working copy with an explicit
+remote URL and token file. Production startup never treats a local-only database
+as a successful substitute. The runtime verifies the component before accepting
+an event.
 
 For event sequence `E`:
 
@@ -194,8 +194,8 @@ Activation drains pending rows before admitting the next tenant event.
 
 Cold restart opens the same object identity and Turso database, verifies the
 artifact again, drains pending work, and resumes at the committed state. No
-custom SQL pager, mutation envelope, local archive, or second data engine is
-part of this path.
+custom SQL pager, alternate mutation format, local archive, or alternate
+storage path is part of this path.
 
 ## 6. Local cache and origin access
 
@@ -236,15 +236,20 @@ binding. The request fixes:
 - compression and bounded records;
 - the expected Catalog state used for optimistic publication.
 
-The runtime validates the request against deployment configuration, writes the
-deterministic Parquet file, and performs the requested Iceberg update. Replaying
-the same identity returns the existing snapshot receipt. Reusing an identity
-with different content is an error. A conflict does not publish a second file
-identity or advance Catalog state.
+The runtime validates the request against deployment configuration and writes
+the deterministic Parquet and Iceberg metadata objects. It returns the proposed
+metadata location and complete metadata but never retains or advances a Catalog
+head. Reusing one deterministic file identity with different content is an
+error; unreferenced immutable objects remain invisible.
 
-The capability returns only the confirmed batch identity, file identity,
-snapshot identity, and row count. It is not a general object-store API, query
-engine, ingest service, compactor, retention service, or Catalog REST server.
+The Catalog object validates that proposal, then atomically installs the new
+table pointer and commit receipt in Turso/SQLite. Only that transaction makes
+the update visible to REST clients or acknowledges Sink. A retry after a lost
+runtime response may reproduce an immutable proposal, while a retry after the
+SQLite transaction is a pure ledger replay.
+
+The capability is not a general object-store API, ingest service, compactor,
+retention service, or Catalog REST server.
 
 Exactly-once behavior is composed from deterministic identities and durable
 ledgers:
@@ -311,10 +316,10 @@ when the corresponding executable path was not exercised.
 
 ## 11. Deliberate non-goals
 
-Verglas does not implement a custom Durable Object SQL engine, an Arrow
-mutation protocol, a DataFusion transaction provider, a direct Durable Object
-lakehouse offload path, a background job Worker, or a public Pipelines control
-plane. Catalog is a product, not a separate infrastructure daemon.
+Verglas does not implement a custom Durable Object SQL implementation, an
+alternate mutation or storage protocol, a direct Durable Object lakehouse offload path, a
+background job Worker, or a public Pipelines control plane. Catalog is a
+product, not a separate infrastructure service.
 
 Streams append. Pipelines transform and checkpoint. Sinks deliver idempotently.
 Catalog owns API and table state. Turso and the origin own durability. Foyer is

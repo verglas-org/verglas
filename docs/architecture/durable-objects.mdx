@@ -49,11 +49,10 @@ export class Counter extends DurableObject {
 }
 ```
 
-The target WIT boundary returns rows as JSON-compatible records. Arrow mutation
-envelopes are not part of the DO transaction protocol. There is no custom
-SQLite pager, custom replica store, or DataFusion-backed DO table provider.
-DataFusion may be used by a Pipeline's stateless SQL transform, but it is not a
-DO storage or commit engine.
+The target WIT boundary returns rows as JSON-compatible records. Alternate
+mutation envelopes are not part of the DO transaction protocol. There is no
+custom SQLite pager, secondary state store, or alternate DO table provider. A
+Pipeline's stateless SQL evaluator is separate from DO storage and commits.
 
 ## Transactional Stream publication
 

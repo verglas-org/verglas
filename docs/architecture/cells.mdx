@@ -38,9 +38,9 @@ An external sync ingress validates the current placement lease before forwarding
 the push, so a stale cell cannot open or push another owner's database.
 
 The lease is a placement and synchronization fence. It is not a lease-fenced
-S3 CAS, a second SQL commit authority, or a custom database protocol. The DO
-runtime retains no custom SQLite pager, DataFusion transaction provider, Arrow
-mutation envelope, or direct Iceberg offload path.
+object-store write path, a second SQL commit authority, or a custom database
+protocol. The DO runtime retains no custom SQLite pager, alternate SQL provider,
+or direct Iceberg offload path.
 
 A replacement cell first revokes the prior owner, opens the DO's own remote
 Turso database, and restores a local working copy with its sync sidecars. A

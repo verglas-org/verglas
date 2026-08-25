@@ -1,8 +1,8 @@
 //! Static access-key lookup for M1 SigV4 validation (issue #7).
 //!
-//! Engines present Verglas-issued credentials; the s3s service reconstructs
+//! Callers present Verglas-issued credentials; the s3s service reconstructs
 //! canonical requests and compares signatures against secrets returned here.
-//! Per-tenant issuance replaces this table in M2 (#33).
+//! Credential issuance belongs to the owning deployment.
 
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ impl StaticAuth {
         StaticAuth { keys }
     }
 
-    /// Convenience constructor for the single dev keypair `verglas-server` configures today.
+    /// Builds an authenticator for one explicitly configured credential pair.
     pub fn from_single(
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
