@@ -1,7 +1,7 @@
 //! Tenant-cell supervision for one Durable Object Worker per owner.
 //!
-//! Celld starts and fences resident processes. Placement is an external
-//! responsibility; celld has no replica election or local CAS fallback.
+//! Verglasd starts and fences resident processes. Placement is an external
+//! responsibility; the daemon has no replica election or local CAS fallback.
 
 mod alarm;
 mod control;

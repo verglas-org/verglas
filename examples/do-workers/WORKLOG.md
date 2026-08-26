@@ -46,3 +46,6 @@
   artifact descriptor. Initial activation still compiles real WASM, while the
   required process restart reuses verified cwasm bytes instead of recompiling
   all six products for another ten minutes.
+- #171: Updated the factual harness to launch `verglasd`, use
+  `--verglasd-control`, and keep its private socket and logs under that name.
+  No old executable or argument alias is accepted.

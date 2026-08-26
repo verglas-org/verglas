@@ -370,8 +370,8 @@ impl WorkerRuntime {
 
 /// Applies the bounded virtual-memory and asynchronous Worker engine policy.
 ///
-/// The reservation stays well below celld's per-process address-space ceiling.
-/// Linear memory may still grow by relocation, while the container and celld
+/// The reservation stays well below verglasd's per-process address-space ceiling.
+/// Linear memory may still grow by relocation, while the container and verglasd
 /// retain the authoritative hard memory budgets.
 #[allow(deprecated)]
 pub(crate) fn configure_worker_engine(config: &mut Config) {
@@ -411,7 +411,7 @@ fn complete_event<T>(
 mod engine_config_tests {
     use super::*;
 
-    /// Worker engines reserve bounded virtual memory so celld's hard process ceiling remains usable.
+    /// Worker engines reserve bounded virtual memory so verglasd's hard process ceiling remains usable.
     #[test]
     fn worker_engine_uses_bounded_linear_memory_reservations() {
         let mut config = Config::new();

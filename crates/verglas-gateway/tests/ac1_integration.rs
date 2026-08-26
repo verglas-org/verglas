@@ -1,4 +1,4 @@
-//! Gateway-level AC1 proof using real celld supervision, runtime, and JS component.
+//! Gateway-level AC1 proof using real daemon supervision, runtime, and JS component.
 
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use verglas_gateway::{ArtifactProduct, Gateway, Manifest};
 
-/// Child process guard that prevents an assertion failure from orphaning celld.
+/// Child process guard that prevents an assertion failure from orphaning daemon.
 struct ManagedChild(Child);
 
 impl Deref for ManagedChild {
@@ -58,21 +58,21 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
         .to_owned();
     assert!(components.join(format!("{digest}.wasm")).is_file());
 
-    let celld = target_root().join("debug/verglas-celld");
+    let daemon = target_root().join("debug/verglasd");
     // This test-only binary preserves the production EventEndpoint,
     // WorkerRuntime, and embedded TursoStore chain in one build target.
     let runtime_child = target_root().join("debug/verglas-runtime-test-support");
     assert!(
-        celld.is_file(),
-        "build target/debug/verglas-celld before this test"
+        daemon.is_file(),
+        "build target/debug/verglasd before this test"
     );
     assert!(
         runtime_child.is_file(),
         "build target/debug/verglas-runtime-test-support before this test"
     );
-    let control = root.path().join("celld.sock");
+    let control = root.path().join("verglasd.sock");
     let mut host = ManagedChild(
-        Command::new(&celld)
+        Command::new(&daemon)
             .arg("--host-id")
             .arg("ac1-cell")
             .arg("--root")
@@ -85,7 +85,7 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn real verglas-celld"),
+            .expect("spawn real verglasd"),
     );
     wait_for_socket(&mut host, &control).await;
 
@@ -310,9 +310,9 @@ fn repository_root() -> PathBuf {
 async fn wait_for_socket(child: &mut Child, path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !path.exists() {
-        if let Some(status) = child.try_wait().expect("inspect verglas-celld") {
+        if let Some(status) = child.try_wait().expect("inspect verglasd") {
             panic!(
-                "verglas-celld exited before binding {}: {status}",
+                "verglasd exited before binding {}: {status}",
                 path.display()
             );
         }
@@ -321,13 +321,13 @@ async fn wait_for_socket(child: &mut Child, path: &Path) {
     }
 }
 
-/// Gracefully stops celld so its supervisor drains and kills real children.
+/// Gracefully stops daemon so its supervisor drains and kills real children.
 fn stop_host(host: &mut ManagedChild) {
     let status = Command::new("kill")
         .arg("-INT")
         .arg(host.id().to_string())
         .status()
-        .expect("signal verglas-celld");
+        .expect("signal verglasd");
     assert!(status.success());
-    host.wait().expect("wait verglas-celld");
+    host.wait().expect("wait verglasd");
 }

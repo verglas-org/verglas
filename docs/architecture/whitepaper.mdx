@@ -17,7 +17,7 @@ root. The remaining products are Durable Object components with narrow, explicit
 responsibilities.
 
 The serving path has three infrastructure processes. `verglas-gateway` accepts
-requests and resolves declared bindings. `verglas-celld` supervises isolated
+requests and resolves declared bindings. `verglasd` supervises isolated
 children and enforces lifecycle and resource limits. `verglas-runtime` executes
 Worker and Durable Object components, opens each object's local Turso path,
 maintains a local Foyer cache, reads the configured S3 origin, and implements a
@@ -38,7 +38,7 @@ This repository owns:
 
 - the Worker and Durable Object component ABI;
 - JavaScript and Python component build pipelines;
-- the gateway, celld supervisor, and runtime host;
+- the gateway, verglasd supervisor, and runtime host;
 - Turso-backed Durable Object transactions and lifecycle handling;
 - the prebuilt Stream, Pipeline, Sink, and Catalog products;
 - local Foyer caching and configured S3 origin access;
@@ -67,7 +67,7 @@ call a declared Durable Object, Stream, Pipeline, Sink, or Catalog binding.
 ### 2.2 Durable Object
 
 A Durable Object is a named, single-threaded event target. The gateway derives a
-stable object identity from the declared namespace and object name. Celld starts
+stable object identity from the declared namespace and object name. Verglasd starts
 one isolated runtime child for that identity and assigns its local database path
 under the self-hosted cell data root. The runtime opens one embedded local Turso
 database for durable state.
@@ -152,7 +152,7 @@ edge
 verglas-gateway
   |
   v
-verglas-celld
+verglasd
   |
   v
 verglas-runtime
@@ -162,7 +162,7 @@ verglas-runtime
 and long-lived event-socket actors. It does not own Durable Object state or
 Iceberg credentials.
 
-`verglas-celld` owns supervision. It creates per-object directories under the
+`verglasd` owns supervision. It creates per-object directories under the
 self-hosted cell data root and private Unix sockets, launches runtime children
 with local Turso and component configuration, enforces resource ceilings, and
 makes a child routable only after its endpoint is ready. Suspension requires a
@@ -176,11 +176,11 @@ capabilities. There is no other serving runtime or binary alias. DO state has no
 clustering or replication layer.
 
 Firecracker remains the production isolation boundary. Local process execution
-implements the same celld contract for development and hermetic tests.
+implements the same verglasd contract for development and hermetic tests.
 
 ## 5. Durable Object transactions
 
-At activation, celld gives the runtime the object's local database path under
+At activation, verglasd gives the runtime the object's local database path under
 the self-hosted cell data root. The runtime opens that embedded Turso database
 and verifies the component before accepting an event.
 
@@ -282,18 +282,18 @@ The design prefers a slow correct path over an incorrect fast path.
 - A Stream delivery failure keeps the outbox row and withholds event effects.
 - A Sink or Catalog conflict preserves the Pipeline cursor for retry or operator
   resolution.
-- A runtime crash is recovered by celld under the same object identity.
+- A runtime crash is recovered by verglasd under the same object identity.
 - A corrupt or mismatched component never binds the event socket.
 
 Scale-to-zero is a supervision operation, not a storage transfer protocol.
-Celld stops admitting events, waits for the transaction and outbox fences,
+Verglasd stops admitting events, waits for the transaction and outbox fences,
 performs the final Turso `COMMIT` and explicit WAL checkpoint, closes the event
 endpoint, and stops the child. The same local database path is reopened on cold
 restart. Foyer contents may be retained for faster restart or discarded freely.
 
 ## 9. Security and isolation
 
-The gateway validates all public routes and deployment bindings. Celld validates
+The gateway validates all public routes and deployment bindings. Verglasd validates
 all launch fields and creates private per-object paths. The runtime verifies
 artifact digests and grants only the imports required by the component world.
 
@@ -313,7 +313,7 @@ Acceptance is based on observable behavior rather than type-level substitutes.
 The repository verifies:
 
 - JavaScript and Python component builds with no ambient WASI capability;
-- real gateway → celld → runtime request execution;
+- real gateway → verglasd → runtime request execution;
 - SQL commit and rollback through Turso;
 - commit-gated WebSocket effects;
 - kill-point recovery of the transactional Stream outbox;

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use verglas_celld::{
+use verglasd::{
     ChildCommand, ControlServer, HostId, HostSupervisor, LocalProcessProvisioner, ManagementApi,
 };
 
@@ -71,7 +71,7 @@ impl Config {
     fn control_path(&self) -> PathBuf {
         self.control_socket
             .clone()
-            .unwrap_or_else(|| self.root.join("celld.sock"))
+            .unwrap_or_else(|| self.root.join("verglasd.sock"))
     }
 }
 
@@ -87,7 +87,7 @@ fn next_value(
 
 /// Returns the one supported command-line shape.
 fn usage() -> &'static str {
-    "usage: verglas-celld --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT] [--catalog-host-config PATH]"
+    "usage: verglasd --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT] [--catalog-host-config PATH]"
 }
 
 /// Runs the control endpoint until termination or a fatal socket error.
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
-            return Err("invalid verglas-celld arguments".into());
+            return Err("invalid verglasd arguments".into());
         }
     };
     let control_path = config.control_path();
@@ -112,11 +112,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(provisioner),
     )));
     let mut server = ControlServer::bind_shared(&control_path, supervisor.clone()).await?;
-    eprintln!("verglas-celld control socket: {}", server.path().display());
+    eprintln!("verglasd control socket: {}", server.path().display());
     if let Some(bind_address) = config.management_bind {
         let listener = TcpListener::bind(bind_address).await?;
         let management = ManagementApi::new(&config.root, supervisor).router();
-        eprintln!("verglas-celld management API: http://{bind_address}");
+        eprintln!("verglasd management API: http://{bind_address}");
         tokio::select! {
             result = server.run() => result?,
             result = axum::serve(listener, management) => result?,

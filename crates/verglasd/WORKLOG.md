@@ -57,3 +57,6 @@ Append-only log of changes to this crate, by issue.
 - #171: Added a red process test proving celld previously swallowed a failed child
   shutdown fence. Suspension now moves a failed child behind crash recovery,
   and host shutdown stops every child before returning the first nonzero status.
+- #171: Renamed the supervisor crate and executable from the ambiguous
+  `verglas-celld` name to `verglasd`. The control socket, package imports,
+  diagnostics, and tests use the new name with no binary or CLI alias.

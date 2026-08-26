@@ -11,7 +11,7 @@ members = [
     "crates/verglas-s3",
     "crates/verglas-iceberg",
     "crates/verglas-do-turso",
-    "crates/verglas-celld",
+    "crates/verglasd",
     "crates/verglas-runtime",
     "crates/verglas-do-wasm",
     "crates/verglas-gateway",

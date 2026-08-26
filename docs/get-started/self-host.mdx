@@ -4,7 +4,7 @@ description: "Build and run the six Worker and Durable Object products with embe
 icon: "server"
 ---
 
-Verglas runs as `edge → verglas-gateway → verglas-celld → verglas-runtime`.
+Verglas runs as `edge → verglas-gateway → verglasd → verglas-runtime`.
 The runtime executes exactly six WASM product kinds: Worker, Durable Object,
 Stream, Pipeline, Sink, and Catalog. Infrastructure such as Foyer and the
 Iceberg commit capability does not add products.
@@ -24,7 +24,7 @@ service or token is required.
 From the repository root:
 
 ```sh
-cargo build -p verglas-gateway -p verglas-celld -p verglas-runtime
+cargo build -p verglas-gateway -p verglasd -p verglas-runtime
 ```
 
 This produces the three serving processes under `target/debug`.
@@ -68,7 +68,7 @@ prints storage credentials.
 - Runtime shutdown closes event admission, rejects a pending Stream outbox,
   checkpoints the embedded WAL, and returns a nonzero status when the fence
   fails.
-- Celld propagates a failed child shutdown instead of reporting success.
+- Verglasd propagates a failed child shutdown instead of reporting success.
 - Foyer DRAM and NVMe contents are disposable and may refill from the configured
   origin.
 - The runtime writes immutable Iceberg proposals. The Catalog Durable Object

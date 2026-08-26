@@ -1,6 +1,6 @@
 //! Removed lifecycle orchestration has no compatibility path.
 
-use verglas_celld::SuspendFence;
+use verglasd::SuspendFence;
 
 #[test]
 fn suspend_fence_contains_only_storage_and_event_confirmations() {

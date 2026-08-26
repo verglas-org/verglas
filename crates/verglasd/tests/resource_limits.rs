@@ -1,6 +1,6 @@
 //! Process ceiling configuration tests.
 
-use verglas_celld::WorkerResourceLimits;
+use verglasd::WorkerResourceLimits;
 
 #[test]
 fn resource_limits_reject_zero_and_preserve_values() {

@@ -23,6 +23,8 @@ package are client/tooling surfaces.
 
 ## Repository contents
 
+- `crates/verglas-gateway`: public ingress and binding routing.
+- `crates/verglasd`: the self-hosted process supervisor and lifecycle daemon.
 - `crates/verglas-runtime`: the Wasmtime Worker/Durable Object host with Turso,
   Foyer tiered caching, origin access, and narrow host capabilities.
 - `system/catalog`: the Turso-backed Catalog Worker/Durable Object product.

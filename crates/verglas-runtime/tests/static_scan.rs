@@ -23,7 +23,7 @@ fn runtime_has_no_old_engine_dependency_or_authority() -> Result<(), Box<dyn std
     let manifest = read("Cargo.toml")?;
     assert!(!manifest.contains("verglas-do-engine"));
     assert!(
-        !manifest.contains("verglas-celld"),
+        !manifest.contains("verglasd"),
         "runtime must not depend back on its process supervisor"
     );
     for relative in [

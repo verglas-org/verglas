@@ -144,7 +144,7 @@ impl Fixture {
         self.directory.path().join(format!("{name}.sock"))
     }
 
-    /// Builds a gateway with the fake Worker executor and fake celld spawner.
+    /// Builds a gateway with the fake Worker executor and fake verglasd spawner.
     fn gateway(&self, worker: Arc<dyn WorkerExecutor>) -> Gateway {
         Gateway::with_worker_executor(
             &manifest(self.directory.path()),

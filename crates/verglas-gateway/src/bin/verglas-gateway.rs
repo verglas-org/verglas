@@ -11,7 +11,7 @@ use verglas_gateway::{Gateway, Manifest};
 struct Config {
     manifest: PathBuf,
     listen: SocketAddr,
-    celld_control: PathBuf,
+    verglasd_control: PathBuf,
     data_root: PathBuf,
 }
 
@@ -21,7 +21,7 @@ impl Config {
         let mut arguments = std::env::args().skip(1);
         let mut manifest = None;
         let mut listen = None;
-        let mut celld_control = None;
+        let mut verglasd_control = None;
         let mut data_root = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -35,10 +35,10 @@ impl Config {
                             format!("--listen is not a socket address: {error}")
                         })?);
                 }
-                "--celld-control" => {
-                    celld_control = Some(PathBuf::from(next_value(
+                "--verglasd-control" => {
+                    verglasd_control = Some(PathBuf::from(next_value(
                         &mut arguments,
-                        "--celld-control",
+                        "--verglasd-control",
                     )?));
                 }
                 "--data-root" => {
@@ -51,8 +51,8 @@ impl Config {
         Ok(Self {
             manifest: manifest.ok_or_else(|| format!("missing --manifest\n{}", usage()))?,
             listen: listen.ok_or_else(|| format!("missing --listen\n{}", usage()))?,
-            celld_control: celld_control
-                .ok_or_else(|| format!("missing --celld-control\n{}", usage()))?,
+            verglasd_control: verglasd_control
+                .ok_or_else(|| format!("missing --verglasd-control\n{}", usage()))?,
             data_root: data_root.ok_or_else(|| format!("missing --data-root\n{}", usage()))?,
         })
     }
@@ -70,7 +70,7 @@ fn next_value(
 
 /// Returns the one supported command-line shape.
 fn usage() -> &'static str {
-    "usage: verglas-gateway --manifest PATH --listen ADDR --celld-control PATH --data-root PATH\npublic /* routes run the Worker fetch; /do/<binding>/<name>/* is internal/debug only"
+    "usage: verglas-gateway --manifest PATH --listen ADDR --verglasd-control PATH --data-root PATH\npublic /* routes run the Worker fetch; /do/<binding>/<name>/* is internal/debug only"
 }
 
 /// Loads the manifest and serves its resident DO routes.
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let manifest = Manifest::from_path(&config.manifest)?;
     let listener = TcpListener::bind(config.listen).await?;
-    let gateway = Gateway::new(&manifest, config.celld_control, config.data_root);
+    let gateway = Gateway::new(&manifest, config.verglasd_control, config.data_root);
     gateway.serve(listener).await?;
     Ok(())
 }

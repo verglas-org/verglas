@@ -1,6 +1,6 @@
 //! Substrate-agnostic supervision and fenced routing for one Worker.
 //!
-//! Celld keeps exactly one active process owner for each Durable Object. Placement
+//! Verglasd keeps exactly one active process owner for each Durable Object. Placement
 //! validation is an external responsibility, and no in-process CAS fallback exists
 //! here.
 

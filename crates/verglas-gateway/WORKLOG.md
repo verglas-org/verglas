@@ -25,3 +25,6 @@
 - #171: Deleted remote Turso deployment fields from manifests and spawn requests so a self-hosted gateway routes only the DO identity, local data root, verified component, cache, socket, and declared host capability. The AC1 helper now uses the same embedded production Turso constructor rather than a test-only storage seam.
 - #171: Tightened gateway fixtures and control forwarding tests around the local launch contract. New red tests proved legacy `turso` manifest keys and credential-bearing commands fail before implementation; the updated parser and spawner now reject those fields while preserving Catalog host capability propagation.
 - #171: Added explicit HTTP origins for bindings whose target Worker is placed in another microVM. The gateway now proxies flattened DO calls across that declared boundary, strips hop-by-hop routing headers, authenticates Worker ingress, and renews the cloud activity lease without changing local binding behavior.
+- #171: Renamed the supervisor client to `VerglasdSpawner` and the gateway option
+  to `--verglasd-control`. The former daemon name is rejected rather than
+  retained as a compatibility alias.

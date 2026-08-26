@@ -6,10 +6,10 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use verglas_celld::{ChildCommand, HostId, HostSupervisor, ManagementApi};
+use verglasd::{ChildCommand, HostId, HostSupervisor, ManagementApi};
 
 fn upload_request(script_name: &str, metadata: &str) -> Request<Body> {
-    let boundary = "celld-test-boundary";
+    let boundary = "verglasd-test-boundary";
     let body = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"worker.js\"; filename=\"worker.js\"\r\nContent-Type: application/javascript\r\n\r\nexport default {{ fetch() {{ return new Response(\"ok\"); }} }}\r\n--{boundary}--\r\n"
     );

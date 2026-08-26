@@ -30,7 +30,7 @@ use crate::connection::{DoCallHandler, DoConnection, FetchEvent};
 use crate::error::GatewayError;
 use crate::manifest::{ArtifactProduct, Binding, Manifest, PipelineBinding, SystemBinding};
 use crate::protocol::{FetchResponse, WsOutbound};
-use crate::spawn::{CelldSpawner, DoSpawner, SpawnRequest};
+use crate::spawn::{DoSpawner, SpawnRequest, VerglasdSpawner};
 
 /// Executes one stateless Worker fetch with a gateway-owned DO router.
 #[async_trait]
@@ -149,13 +149,13 @@ impl WorkerExecutor for FailedWorker {
 }
 
 impl Gateway {
-    /// Creates a gateway using celld and loads the Worker component from the manifest.
+    /// Creates a gateway using verglasd and loads the Worker component from the manifest.
     pub fn new(
         manifest: &Manifest,
         control_socket: impl Into<PathBuf>,
         data_root: impl Into<PathBuf>,
     ) -> Self {
-        let spawner = Arc::new(CelldSpawner::new(control_socket.into()));
+        let spawner = Arc::new(VerglasdSpawner::new(control_socket.into()));
         let worker = match load_worker_executor(manifest) {
             Ok(worker) => worker,
             Err(error) => Arc::new(FailedWorker { error }),
@@ -1003,7 +1003,7 @@ fn http_response(
     Ok(response)
 }
 
-/// Builds a celld-safe identity from a binding and URL object name.
+/// Builds a verglasd-safe identity from a binding and URL object name.
 fn do_identity(binding: &str, name: &str) -> Result<String, GatewayError> {
     let identity = format!("{binding}--{name}");
     if identity.is_empty()

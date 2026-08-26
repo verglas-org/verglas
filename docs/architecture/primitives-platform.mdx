@@ -54,8 +54,9 @@ ordinary bindings and stub calls.
 ## Runtime host
 
 `verglas-runtime` is the only serving runtime. It executes Worker and Durable
-Object components through Wasmtime under celld/Firecracker isolation, owns local
-Turso adapters, and uses Foyer memory and disk tiers to cache bytes from the
+Object components through Wasmtime under `verglasd` supervision, with local
+processes for development or Firecracker isolation in production. It owns local
+Turso adapters and uses Foyer memory and disk tiers to cache bytes from the
 configured S3 origin and compiled/runtime data. Foyer is disposable performance
 state, never a commit authority.
 

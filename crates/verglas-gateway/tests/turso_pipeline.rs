@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Mutex;
 use verglas_gateway::{
-    ArtifactProduct, CelldSpawner, DoSpawner, Gateway, GatewayError, Manifest, SpawnRequest,
+    ArtifactProduct, DoSpawner, Gateway, GatewayError, Manifest, SpawnRequest, VerglasdSpawner,
 };
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -395,14 +395,14 @@ async fn gateway_attaches_iceberg_commit_only_to_catalog_spawn()
     Ok(())
 }
 
-/// The gateway serializes the exact host service declaration in the celld command.
+/// The gateway serializes the exact host service declaration in the verglasd command.
 #[tokio::test]
-async fn celld_spawner_forwards_exact_host_service_declaration()
+async fn verglasd_spawner_forwards_exact_host_service_declaration()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let manifest = Manifest::parse(&composition_manifest_source()).expect("composition manifest");
     let directory = tempfile::tempdir()?;
     let data_root = directory.path().join("state");
-    let control_path = directory.path().join("celld.sock");
+    let control_path = directory.path().join("verglasd.sock");
     let do_id = "CATALOG--catalog-1";
     let event_path = data_root.join(do_id).join("events.sock");
     let listener = UnixListener::bind(&control_path)?;
@@ -437,7 +437,7 @@ async fn celld_spawner_forwards_exact_host_service_declaration()
         data_root,
     )
     .with_host_service(manifest.host_services()[0].clone());
-    let returned = CelldSpawner::new(control_path).spawn(request).await?;
+    let returned = VerglasdSpawner::new(control_path).spawn(request).await?;
     assert_eq!(returned, event_path);
     command_task.await??;
     Ok(())
@@ -486,7 +486,7 @@ async fn product_bindings_forward_distinct_commands_and_restart_identity()
             let data_root = directory.path().join("state");
             let do_id = format!("{binding}--{object}");
             let event_path = data_root.join(&do_id).join("events.sock");
-            let control_path = directory.path().join("celld.sock");
+            let control_path = directory.path().join("verglasd.sock");
             let listener = UnixListener::bind(&control_path)?;
             let expected_command = format!(
                 "SPAWN_WORKER {do_id} {} {digest} {component_dir} - {} - -",
@@ -518,7 +518,7 @@ async fn product_bindings_forward_distinct_commands_and_restart_identity()
                 PathBuf::from(component_dir),
                 data_root,
             );
-            let returned = CelldSpawner::new(control_path).spawn(request).await?;
+            let returned = VerglasdSpawner::new(control_path).spawn(request).await?;
             assert_eq!(returned, event_path);
             command_task.await??;
         }

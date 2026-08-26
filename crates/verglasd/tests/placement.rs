@@ -1,6 +1,6 @@
 //! External placement-owner identity tests.
 
-use verglas_celld::HostId;
+use verglasd::HostId;
 
 #[test]
 fn host_identity_is_stable_without_local_placement_logic() {

@@ -2,7 +2,7 @@
 //!
 //! The local implementation forwards the known runtime CLI contract and passes
 //! the operator-owned Catalog startup path only for the exact host capability
-//! declaration. Celld owns process isolation and lifecycle fences without
+//! declaration. Verglasd owns process isolation and lifecycle fences without
 //! inventing a second ownership or CAS protocol.
 
 use std::future::Future;

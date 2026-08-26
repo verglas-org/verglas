@@ -1,9 +1,12 @@
 # Six-product cold-restart acceptance transcript
 
 Captured on 2026-08-25 from `/Users/jfbrown/code/verglas` on macOS. This
-transcript records real self-hosted `verglas-gateway`, `verglas-celld`, and
-`verglas-runtime` processes. The object store was an S3-compatible R2 fixture;
-no tenant component received its endpoint or credentials.
+transcript predates the supervisor rename and retains the then-current
+`verglas-celld` executable name as factual evidence. The current executable is
+`verglasd`; no old binary alias remains. The run used real self-hosted
+`verglas-gateway`, supervisor, and `verglas-runtime` processes. The object store
+was an S3-compatible R2 fixture; no tenant component received its endpoint or
+credentials.
 
 ## Toolchain
 
@@ -50,21 +53,21 @@ $ jq '.artifacts | keys' /tmp/verglas-do-cold-chain-iP8G14/py/gateway.json
 ```
 
 `ICEBERG_COMMIT → verglas-runtime` is a service binding, not another artifact
-product. Requests followed `edge → verglas-gateway → verglas-celld →
-verglas-runtime`.
+product. Requests followed the then-current `edge → verglas-gateway → verglas-celld →
+verglas-runtime` process path.
 
 ## Assertions executed for each language
 
 The harness performed the following sequence against production debug binaries:
 
 1. Build Worker, Durable Object, Stream, Pipeline, Sink, and Catalog components.
-2. Start celld and gateway with a fresh embedded-Turso data root.
+2. Start the then-current `verglas-celld` binary and gateway with a fresh embedded-Turso data root.
 3. Send two Worker `/incr` requests and require counts 1 and 2.
 4. Process Stream records through Pipeline, Sink, and Catalog.
 5. Require Pipeline cursor 2 with no pending batch.
 6. Require exactly one confirmed Sink batch.
 7. Require exactly one Catalog publication.
-8. Send SIGINT to gateway and celld; each child runtime closes admission,
+8. Send SIGINT to gateway and the supervisor; each child runtime closes admission,
    rejects pending outbox work, checkpoints its embedded WAL, and exits.
 9. Restart both against the same Turso data root and compiled-component cache.
 10. Require count 2, cursor 2, no pending batch, and the same single Sink and

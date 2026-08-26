@@ -26,7 +26,7 @@ use crate::{HostSupervisor, SupervisorError};
 const SCRIPT_ROOT: &str = "workers/scripts";
 const NAMESPACE_FILE: &str = "workers/namespaces.json";
 
-/// Shared HTTP management state for one celld host.
+/// Shared HTTP management state for one verglasd host.
 #[derive(Clone)]
 pub struct ManagementApi {
     state: Arc<ManagementState>,
@@ -39,7 +39,7 @@ struct ManagementState {
     records: Mutex<ManagementRecords>,
 }
 
-/// In-memory index backed by the celld root's script and namespace records.
+/// In-memory index backed by the verglasd root's script and namespace records.
 struct ManagementRecords {
     scripts: BTreeMap<String, ScriptRecord>,
     namespaces: BTreeMap<String, NamespaceRecord>,
@@ -126,7 +126,7 @@ enum ApiError {
 }
 
 impl ManagementApi {
-    /// Creates a metadata API rooted below one celld directory.
+    /// Creates a metadata API rooted below one verglasd directory.
     pub fn new(root: impl AsRef<Path>, supervisor: Arc<Mutex<HostSupervisor>>) -> Self {
         Self {
             state: Arc::new(ManagementState {
@@ -392,7 +392,7 @@ fn validate_binding(binding: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Writes a script's metadata and module content beneath the celld root.
+/// Writes a script's metadata and module content beneath the verglasd root.
 async fn store_script(
     state: &ManagementState,
     script_name: &str,

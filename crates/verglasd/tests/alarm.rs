@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use verglas_celld::{AlarmFuture, AlarmSchedule, AlarmWake, ChildCommand, HostId, HostSupervisor};
+use verglasd::{AlarmFuture, AlarmSchedule, AlarmWake, ChildCommand, HostId, HostSupervisor};
 
 /// Records every advisory wake delivered by the alarm scheduler.
 #[derive(Clone, Default)]

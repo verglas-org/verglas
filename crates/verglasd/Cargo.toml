@@ -1,6 +1,6 @@
 [package]
-name = "verglas-celld"
-description = "Tenant cell supervision and resource-aware Durable Object placement"
+name = "verglasd"
+description = "Host-level process and lifecycle supervisor for Durable Objects"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

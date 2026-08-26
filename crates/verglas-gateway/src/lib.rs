@@ -1,7 +1,7 @@
 //! OSS Durable Object gateway for wrangler-style manifests.
 //!
 //! The library owns HTTP and WebSocket connections, launches one resident DO
-//! through celld, and exchanges frozen NDJSON events over its private socket.
+//! through verglasd, and exchanges frozen NDJSON events over its private socket.
 
 mod connection;
 mod error;
@@ -16,5 +16,5 @@ pub use manifest::{
     ArtifactDescriptor, ArtifactProduct, Binding, HostServiceBinding, Manifest, ManifestError,
     Migration, PipelineBinding, SystemBinding,
 };
-pub use spawn::{CelldSpawner, DoSpawner, SpawnRequest};
+pub use spawn::{DoSpawner, SpawnRequest, VerglasdSpawner};
 pub use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};

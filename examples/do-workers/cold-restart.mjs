@@ -39,7 +39,7 @@ const PRODUCT_DIRS = Object.fromEntries(PRODUCTS.map((product) => [
   join(REPO, 'system', product),
 ]));
 const DEFAULT_GATEWAY = join(REPO, 'target/debug/verglas-gateway');
-const DEFAULT_CELLD = join(REPO, 'target/debug/verglas-celld');
+const DEFAULT_VERGLASD = join(REPO, 'target/debug/verglasd');
 const DEFAULT_RUNTIME = join(REPO, 'target/debug/verglas-runtime');
 const BUILD_ROOT_PREFIX = 'verglas-do-cold-chain-';
 const READY_TIMEOUT_MS = 20_000;
@@ -483,12 +483,12 @@ async function assertProgress(base, count) {
  * Run one language through increment, process, shutdown, restart, and replay.
  * @param {{language: string, root: string, workerManifest: object, products: object}} built
  * @param {string} gatewayBin
- * @param {string} celldBin
+ * @param {string} verglasdBin
  * @param {string} runtimeBin
  * @param {string} runtimeHostConfig
  * @returns {Promise<object>}
  */
-async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostConfig) {
+async function runLanguage(built, gatewayBin, verglasdBin, runtimeBin, runtimeHostConfig) {
   const manifest = aggregateManifest(built);
   await verifyManifestArtifacts(manifest);
   const manifestPath = join(built.root, 'gateway.json');
@@ -496,14 +496,14 @@ async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostC
   const dataRoot = manifest.data_root;
   await mkdir(dataRoot, { recursive: true });
   const logs = join(built.root, 'logs');
-  const control = join(built.root, 'celld.sock');
+  const control = join(built.root, 'verglasd.sock');
   const port = built.language === 'js' ? 18180 : 18181;
   const base = `http://127.0.0.1:${port}`;
-  let celld;
+  let verglasd;
   let gateway;
   const start = () => {
-    celld = spawnLogged(
-      celldBin,
+    verglasd = spawnLogged(
+      verglasdBin,
       [
         '--host-id', `${built.language}-cold-cell`,
         '--root', dataRoot,
@@ -512,11 +512,11 @@ async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostC
         '--catalog-host-config', runtimeHostConfig,
       ],
       REPO,
-      join(logs, 'celld.log'),
+      join(logs, 'verglasd.log'),
     );
     gateway = spawnLogged(
       gatewayBin,
-      ['--manifest', manifestPath, '--listen', `127.0.0.1:${port}`, '--celld-control', control, '--data-root', dataRoot],
+      ['--manifest', manifestPath, '--listen', `127.0.0.1:${port}`, '--verglasd-control', control, '--data-root', dataRoot],
       REPO,
       join(logs, 'gateway.log'),
     );
@@ -532,8 +532,8 @@ async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostC
     await assertProgress(base, 2);
     await stopProcess(gateway);
     gateway = undefined;
-    await stopProcess(celld);
-    celld = undefined;
+    await stopProcess(verglasd);
+    verglasd = undefined;
 
     await start();
     await assertProgress(base, 2);
@@ -544,7 +544,7 @@ async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostC
     return { language: built.language, manifestPath, dataRoot, logs };
   } finally {
     await stopProcess(gateway);
-    await stopProcess(celld);
+    await stopProcess(verglasd);
   }
 }
 
@@ -553,10 +553,10 @@ async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostC
  */
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  // Keep celld's per-object Unix sockets below the platform SUN_LEN limit.
+  // Keep verglasd's per-object Unix sockets below the platform SUN_LEN limit.
   const buildRoot = await mkdtemp(join(process.env.VERGLAS_E2E_TMPDIR ?? '/tmp', BUILD_ROOT_PREFIX));
   const gatewayBin = process.env.VERGLAS_GATEWAY_BIN ?? DEFAULT_GATEWAY;
-  const celldBin = process.env.VERGLAS_CELLD_BIN ?? DEFAULT_CELLD;
+  const verglasdBin = process.env.VERGLASD_BIN ?? DEFAULT_VERGLASD;
   const runtimeBin = process.env.VERGLAS_RUNTIME_BIN ?? DEFAULT_RUNTIME;
   const built = [];
   const privateFiles = [];
@@ -573,14 +573,14 @@ async function main() {
     }
     process.stdout.write(`built artifacts under ${buildRoot}\n`);
     if (options.buildOnly) return;
-    for (const binary of [gatewayBin, celldBin, runtimeBin]) await access(binary);
+    for (const binary of [gatewayBin, verglasdBin, runtimeBin]) await access(binary);
     for (const item of built) {
       const host = await writeRuntimeHostConfig(item.root, s3, item.deployment);
       privateFiles.push(host.path, host.credentialsPath);
       const result = await runLanguage(
         item,
         gatewayBin,
-        celldBin,
+        verglasdBin,
         runtimeBin,
         host.path,
       );

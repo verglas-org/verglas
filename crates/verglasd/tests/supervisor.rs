@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use verglas_celld::{
+use verglasd::{
     ChildCommand, ChildSpec, ChildState, HostId, HostSupervisor, SuspendFence, WorkerComponent,
 };
 

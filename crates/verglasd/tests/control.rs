@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use verglas_celld::{ChildCommand, ControlServer, HostId, HostSupervisor};
+use verglasd::{ChildCommand, ControlServer, HostId, HostSupervisor};
 
 const DIGEST: &str = "ababaabababaabababaabababaabababaabababaabababaabababaabababaaba";
 
@@ -39,7 +39,7 @@ fn argv_dump_child() -> ChildCommand {
 #[tokio::test]
 async fn spawn_worker_forwards_exact_local_arguments() {
     let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
+    let control_path = root.path().join("verglasd.sock");
     let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
     let mut server = ControlServer::bind(&control_path, supervisor)
         .await
@@ -92,7 +92,7 @@ async fn spawn_worker_forwards_exact_local_arguments() {
 #[tokio::test]
 async fn spawn_worker_accepts_local_launch_contract_without_remote_credentials() {
     let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
+    let control_path = root.path().join("verglasd.sock");
     let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
     let mut server = ControlServer::bind(&control_path, supervisor)
         .await
@@ -120,7 +120,7 @@ async fn spawn_worker_accepts_local_launch_contract_without_remote_credentials()
 async fn spawn_worker_rejects_paths_outside_cell_root() {
     let root = tempfile::tempdir().expect("cell root");
     let outside = tempfile::tempdir().expect("outside root");
-    let control_path = root.path().join("celld.sock");
+    let control_path = root.path().join("verglasd.sock");
     let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
     let mut server = ControlServer::bind(&control_path, supervisor)
         .await
@@ -146,7 +146,7 @@ async fn spawn_worker_rejects_paths_outside_cell_root() {
 #[tokio::test]
 async fn removed_durability_commands_are_hard_errors() {
     let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
+    let control_path = root.path().join("verglasd.sock");
     let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
     let mut server = ControlServer::bind(&control_path, supervisor)
         .await
@@ -169,7 +169,7 @@ async fn removed_durability_commands_are_hard_errors() {
 #[tokio::test]
 async fn suspend_requires_storage_checkpoint_outbox_and_clean_shutdown() {
     let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
+    let control_path = root.path().join("verglasd.sock");
     let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
     let mut server = ControlServer::bind(&control_path, supervisor)
         .await

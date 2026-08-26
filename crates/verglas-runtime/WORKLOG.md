@@ -48,3 +48,6 @@
 - #171: Removed the unused reverse Cargo dependency from runtime to celld. Celld launches runtime only through the process/control contract, so the runtime dependency graph no longer points back into its supervisor.
 - #171: Routed the Catalog's stable logical bucket through an exact deployment-owned physical bucket. This keeps the system Worker component reusable across deployments while the host retains the only mapping to provider storage.
 - #171: Runtime signal shutdown now drops the event listener before invoking Turso's explicit shutdown fence. Process exit therefore requires no abandoned transaction, no undelivered Stream outbox row, and a complete embedded WAL checkpoint.
+- #171: Updated the dependency-direction guard for the supervisor's final
+  `verglasd` package name. Runtime remains independent and is launched only
+  through the process contract.

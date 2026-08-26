@@ -1,4 +1,4 @@
-//! Host capability declaration propagation tests for celld control and provisioning.
+//! Host capability declaration propagation tests for verglasd control and provisioning.
 
 use std::path::Path;
 use std::process::{Command, ExitStatus};
@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use verglas_celld::{
+use verglasd::{
     ChildCommand, ChildDescriptor, ControlServer, HostId, HostServiceBinding, HostSupervisor,
     ProvisionError, ProvisionFuture, ProvisionHandle, ProvisionRequest, ProvisionedChild,
     Provisioner,
@@ -114,7 +114,7 @@ async fn request(server: &mut ControlServer, path: &Path, command: &str) -> Stri
 #[tokio::test]
 async fn control_forwards_exact_host_service_to_provisioner() {
     let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
+    let control_path = root.path().join("verglasd.sock");
     let recording = RecordingProvisioner::default();
     let supervisor = HostSupervisor::with_provisioner(
         HostId::new("cell-a"),

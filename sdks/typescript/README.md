@@ -67,7 +67,7 @@ client. Log writes remain best-effort and use the normal table append contract.
 
 ## Worker script management
 
-`WorkersManagementClient` remains available from the package root for celld's
+`WorkersManagementClient` remains available from the package root for verglasd's
 account-prefix-free Cloudflare-shaped script management API. It supports module-
 syntax script upload, list, get, and delete operations, multipart form helpers,
 and typed API errors. Script metadata retains Cloudflare namespace binding

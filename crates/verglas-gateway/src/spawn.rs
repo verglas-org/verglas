@@ -1,4 +1,4 @@
-//! Celld control-plane spawning and bounded event-socket readiness.
+//! Verglasd control-plane spawning and bounded event-socket readiness.
 //!
 //! The gateway sends one complete `SPAWN_WORKER` request, including the exact
 //! declared host capability when present. It never starts a replica, managed CAS
@@ -62,7 +62,7 @@ impl SpawnRequest {
         self
     }
 
-    /// Returns the celld-safe Durable Object identity.
+    /// Returns the verglasd-safe Durable Object identity.
     pub fn do_id(&self) -> &str {
         &self.do_id
     }
@@ -128,11 +128,11 @@ pub trait DoSpawner: Send + Sync {
 
 /// Local Unix control client for the one-path Worker spawn command.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CelldSpawner {
+pub struct VerglasdSpawner {
     control_socket: PathBuf,
 }
 
-impl CelldSpawner {
+impl VerglasdSpawner {
     /// Creates a spawner that sends commands to one host-local control socket.
     pub fn new(control_socket: impl Into<PathBuf>) -> Self {
         Self {
@@ -170,7 +170,7 @@ impl CelldSpawner {
         })
     }
 
-    /// Sends the complete worker launch contract to celld.
+    /// Sends the complete worker launch contract to verglasd.
     async fn spawn_worker(
         &self,
         request: &SpawnRequest,
@@ -241,7 +241,7 @@ impl CelldSpawner {
 }
 
 #[async_trait]
-impl DoSpawner for CelldSpawner {
+impl DoSpawner for VerglasdSpawner {
     /// Starts one Worker and waits until its event socket is a Unix socket.
     async fn spawn(&self, request: SpawnRequest) -> Result<PathBuf, GatewayError> {
         if request.do_id().is_empty() {

@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use verglas_gateway::{CelldSpawner, DoSpawner, Gateway, GatewayError, Manifest, SpawnRequest};
+use verglas_gateway::{DoSpawner, Gateway, GatewayError, Manifest, SpawnRequest, VerglasdSpawner};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -24,11 +24,11 @@ fn manifest_source() -> String {
 
 /// Sends one complete Worker command and retries until the event socket binds.
 #[tokio::test]
-async fn celld_spawner_sends_exact_worker_command_and_waits_for_event_bind()
+async fn verglasd_spawner_sends_exact_worker_command_and_waits_for_event_bind()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let directory = tempfile::tempdir()?;
     let data_root = directory.path().join("state");
-    let control_path = directory.path().join("celld.sock");
+    let control_path = directory.path().join("verglasd.sock");
     let event_path = data_root.join("COUNTER--alice").join("events.sock");
     let listener = UnixListener::bind(&control_path)?;
     let expected_event = event_path.clone();
@@ -70,7 +70,7 @@ async fn celld_spawner_sends_exact_worker_command_and_waits_for_event_bind()
         data_root,
     );
     let started = Instant::now();
-    let returned = CelldSpawner::new(control_path).spawn(request).await?;
+    let returned = VerglasdSpawner::new(control_path).spawn(request).await?;
     assert_eq!(returned, event_path);
     assert!(started.elapsed() >= std::time::Duration::from_millis(40));
     control_task.await??;
@@ -223,7 +223,7 @@ impl Fixture {
     fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let directory = tempfile::tempdir()?;
         let manifest = Manifest::parse(&manifest_source())?;
-        let control_path = directory.path().join("celld.sock");
+        let control_path = directory.path().join("verglasd.sock");
         let gateway = Gateway::new(&manifest, &control_path, directory.path().join("state"));
         Ok(Self {
             directory,
@@ -242,7 +242,7 @@ impl Fixture {
             .join("events.sock")
     }
 
-    /// Starts a fake celld control endpoint that validates the one-path command.
+    /// Starts a fake verglasd control endpoint that validates the one-path command.
     async fn control_for(
         &self,
         event_path: &Path,

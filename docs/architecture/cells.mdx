@@ -37,7 +37,7 @@ event only after SQL `COMMIT` succeeds and the runtime completes an explicit WAL
 checkpoint. The cell filesystem is the authoritative durability boundary for the
 DO database.
 
-Celld assigns one local data path to each object beneath the self-hosted cell
+Verglasd assigns one local data path to each object beneath the self-hosted cell
 data root. Cold restart reopens that same path and resumes from its committed
 state. A path is never shared between DO identities. The runtime retains no
 custom SQLite pager, alternate SQL provider, or direct Iceberg offload path.

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use verglas_celld::{
+use verglasd::{
     HostServiceBinding, LocalProcessProvisioner, ProvisionError, ProvisionRequest, Provisioner,
     WorkerComponent,
 };
@@ -31,10 +31,7 @@ fn request(root: &Path, host_service: Option<HostServiceBinding>) -> (ProvisionR
 }
 
 /// Stops one test child after its launch arguments have been inspected.
-async fn stop_child(
-    provisioner: &LocalProcessProvisioner,
-    child: &mut verglas_celld::ProvisionedChild,
-) {
+async fn stop_child(provisioner: &LocalProcessProvisioner, child: &mut verglasd::ProvisionedChild) {
     provisioner.kill(child).await.expect("kill child");
     provisioner.wait(child).await.expect("wait child");
 }

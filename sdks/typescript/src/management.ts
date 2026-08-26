@@ -1,18 +1,18 @@
-//! Cloudflare Workers-shaped management client for a celld host.
+//! Cloudflare Workers-shaped management client for a verglasd host.
 //!
-//! Routes are intentionally account-prefix-free because celld already scopes the
+//! Routes are intentionally account-prefix-free because verglasd already scopes the
 //! listener to one tenant cell. The client unwraps Cloudflare response envelopes
 //! and preserves structured API errors for callers.
 
 /** A message returned in a Cloudflare-style success or error envelope. */
 export interface WorkersManagementMessage {
-  /** Stable HTTP/API error code when supplied by celld. */
+  /** Stable HTTP/API error code when supplied by verglasd. */
   code: number | string;
   /** Human-readable message. */
   message: string;
 }
 
-/** Error thrown when a celld management request is not successful. */
+/** Error thrown when a verglasd management request is not successful. */
 export class WorkersManagementError extends Error {
   /** Structured errors exactly as returned by the API. */
   readonly errors: WorkersManagementMessage[];
@@ -41,7 +41,7 @@ export interface WorkersDurableObjectBinding {
   script_name?: string;
 }
 
-/** Script metadata accepted by the celld multipart upload route. */
+/** Script metadata accepted by the verglasd multipart upload route. */
 export interface WorkerScriptMetadata {
   /** Module file that is the Worker entrypoint. */
   main_module: string;
@@ -66,7 +66,7 @@ export interface WorkerScriptUploadParts {
   modules: Record<string, WorkerModuleSource>;
 }
 
-/** Script metadata returned by the celld management API. */
+/** Script metadata returned by the verglasd management API. */
 export interface WorkerScript extends WorkerScriptMetadata {
   /** Stable script identifier. */
   id: string;
@@ -86,7 +86,7 @@ interface WorkersEnvelope<T> {
   result?: T | null;
 }
 
-/** Builds the module-syntax multipart body expected by celld. */
+/** Builds the module-syntax multipart body expected by verglasd. */
 export function buildWorkerScriptFormData(upload: WorkerScriptUpload | WorkerScriptUploadParts): FormData {
   const form = new FormData();
   const metadata: WorkerScriptMetadata = "metadata" in upload
@@ -102,12 +102,12 @@ export function buildWorkerScriptFormData(upload: WorkerScriptUpload | WorkerScr
 /** Short alias for callers that name the multipart helper after the script form. */
 export const buildScriptFormData = buildWorkerScriptFormData;
 
-/** Client for the account-prefix-free celld Workers management API. */
+/** Client for the account-prefix-free verglasd Workers management API. */
 export class WorkersManagementClient {
   readonly #baseUrl: string;
   readonly #fetch: ManagementFetch;
 
-  /** Binds the client to one celld base URL and optional fetch implementation. */
+  /** Binds the client to one verglasd base URL and optional fetch implementation. */
   constructor(baseUrl: string, fetchImpl: ManagementFetch = globalThis.fetch) {
     if (!baseUrl) throw new Error("WorkersManagementClient: baseUrl is required");
     if (typeof fetchImpl !== "function") throw new Error("WorkersManagementClient: fetch implementation is required");

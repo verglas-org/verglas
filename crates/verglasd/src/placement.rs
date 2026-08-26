@@ -1,6 +1,6 @@
 //! Stable identity for the external placement owner.
 //!
-//! Celld supervises the one process assigned by cloud placement. It does not
+//! Verglasd supervises the one process assigned by cloud placement. It does not
 //! elect owners, validate leases, or run a local compare-and-swap path.
 
 /// Stable identity of one tenant cell host.

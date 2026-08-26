@@ -23,22 +23,22 @@ pub enum GatewayError {
         /// Object name that was not declared.
         name: String,
     },
-    /// A route identity cannot be represented as a celld-safe child identity.
+    /// A route identity cannot be represented as a verglasd-safe child identity.
     #[error("invalid Durable Object route identity: {identity}")]
     InvalidIdentity {
         /// Rejected identity text.
         identity: String,
     },
-    /// The celld control socket could not be reached or read.
-    #[error("celld control socket failed during {operation}: {message}")]
+    /// The verglasd control socket could not be reached or read.
+    #[error("verglasd control socket failed during {operation}: {message}")]
     ControlIo {
         /// Control operation that failed.
         operation: &'static str,
         /// Operating-system detail.
         message: String,
     },
-    /// Celld rejected a spawn command.
-    #[error("celld rejected Durable Object spawn: {message}")]
+    /// Verglasd rejected a spawn command.
+    #[error("verglasd rejected Durable Object spawn: {message}")]
     SpawnRejected {
         /// One-line control response detail.
         message: String,

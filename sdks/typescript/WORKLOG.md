@@ -76,3 +76,5 @@
 - PP8 closure TDD: Added scheduler/job-worker package-surface negatives before deleting the retired SDK worker contract. The initial targeted run failed as expected with three failures because the old source files, exports/docs/build entries, and retired worker names were still present.
 - #171: Removed the obsolete semantic S3 Vector/Graph clients, `/v0` data client, Integration reflection, catalog change-feed, graph handle, dashboard bindings/chart declarations, and their positive tests and package exports. Kept the Catalog/table and Cloudflare Worker management clients, and made run IDs require `crypto.randomUUID` instead of time/random fallbacks.
 - #171: Regenerated the pnpm lock after the retained build gained its explicit `tsup` dependency and approved only esbuild's required install script. Frozen package scripts now run tests, typechecking, and the two-entry SDK build successfully.
+- #171: Updated Worker management documentation for the final `verglasd`
+  supervisor name. The client API and Cloudflare-shaped routes are unchanged.
