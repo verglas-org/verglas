@@ -152,10 +152,13 @@ impl WorkerResourceLimits {
 }
 
 impl Default for WorkerResourceLimits {
-    /// Returns the prototype's hard default process ceilings.
+    /// Leaves virtual address space to the one-Worker microVM's cgroup while
+    /// retaining a bounded descriptor table. Wasmtime reserves large sparse
+    /// address ranges that are not resident RAM, so an RLIMIT_AS default would
+    /// kill otherwise tiny Workers during first instantiation.
     fn default() -> Self {
         Self {
-            memory_bytes: 4 * 1024 * 1024 * 1024,
+            memory_bytes: libc::RLIM_INFINITY,
             open_files: 1024,
         }
     }
@@ -669,7 +672,10 @@ impl Provisioner for LocalProcessProvisioner {
                 .env("VERGLAS_CELL_HOST", request.host_id())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                // Runtime failures must reach the microVM log stream; hiding
+                // stderr turns actionable guest failures into an opaque closed
+                // event socket at the gateway.
+                .stderr(Stdio::inherit())
                 .kill_on_drop(true);
             if let Some(cache_dir) = request.component().cwasm_cache_dir() {
                 command.arg("--cwasm-cache-dir").arg(cache_dir);
