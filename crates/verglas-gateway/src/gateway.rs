@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
@@ -93,6 +94,34 @@ struct GatewayState {
 #[derive(Clone)]
 struct ActivityReporter {
     events: tokio::sync::mpsc::Sender<()>,
+    active: Arc<AtomicUsize>,
+}
+
+impl ActivityReporter {
+    fn begin(&self) -> ActivityLease {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let _ = self.events.try_send(());
+        ActivityLease {
+            reporter: Some(self.clone()),
+        }
+    }
+}
+
+/// Keeps the Worker's idle lease alive until the request has fully completed.
+struct ActivityLease {
+    reporter: Option<ActivityReporter>,
+}
+
+impl Drop for ActivityLease {
+    fn drop(&mut self) {
+        let Some(reporter) = &self.reporter else {
+            return;
+        };
+        reporter.active.fetch_sub(1, Ordering::AcqRel);
+        // Renew once more at completion, making the ten-second deadline start
+        // after the final active request rather than after it began.
+        let _ = reporter.events.try_send(());
+    }
 }
 
 /// The manifest binding and object name that identify one resident actor.
@@ -357,9 +386,21 @@ fn activity_reporter_from_env() -> Option<ActivityReporter> {
     let tenant = std::env::var("VERGLAS_TENANT_ID").ok()?;
     let worker = std::env::var("VERGLAS_WORKER_NAME").ok()?;
     let (events, mut receiver) = tokio::sync::mpsc::channel(1);
+    let active = Arc::new(AtomicUsize::new(0));
+    let active_requests = Arc::clone(&active);
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        while receiver.recv().await.is_some() {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                event = receiver.recv() => {
+                    if event.is_none() {
+                        break;
+                    }
+                }
+                _ = heartbeat.tick(), if active_requests.load(Ordering::Acquire) > 0 => {}
+            }
             let _ = client
                 .post(&url)
                 .header("x-verglas-cloud-internal", &token)
@@ -371,14 +412,14 @@ fn activity_reporter_from_env() -> Option<ActivityReporter> {
                 .await;
         }
     });
-    Some(ActivityReporter { events })
+    Some(ActivityReporter { events, active })
 }
 
-fn report_activity(state: &GatewayState) {
-    let Some(activity) = &state.activity else {
-        return;
-    };
-    let _ = activity.events.try_send(());
+fn begin_activity(state: &GatewayState) -> ActivityLease {
+    state
+        .activity
+        .as_ref()
+        .map_or(ActivityLease { reporter: None }, ActivityReporter::begin)
 }
 
 fn require_ingress(state: &GatewayState, headers: &HeaderMap) -> Result<(), GatewayError> {
@@ -639,7 +680,7 @@ async fn public_handler(
     request: Request,
 ) -> Result<Response, GatewayError> {
     require_ingress(&state, request.headers())?;
-    report_activity(&state);
+    let _activity = begin_activity(&state);
     let (mut parts, body) = request.into_parts();
     let ws_upgrade = if is_websocket_upgrade(&parts.headers) {
         Some(
@@ -762,7 +803,7 @@ async fn forward_http(
     body: Bytes,
 ) -> Result<Response, GatewayError> {
     require_ingress(&state, &headers)?;
-    report_activity(&state);
+    let _activity = begin_activity(&state);
     let request_headers = request_headers(&headers)?;
     let prefix = format!("/do/{binding}/{name}");
     let suffix = uri
@@ -966,4 +1007,27 @@ fn do_identity(binding: &str, name: &str) -> Result<String, GatewayError> {
         return Err(GatewayError::InvalidIdentity { identity });
     }
     Ok(identity)
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn activity_leases_track_overlapping_requests_until_the_last_drop() {
+        let (events, _receiver) = tokio::sync::mpsc::channel(1);
+        let active = Arc::new(AtomicUsize::new(0));
+        let reporter = ActivityReporter {
+            events,
+            active: Arc::clone(&active),
+        };
+
+        let first = reporter.begin();
+        let second = reporter.begin();
+        assert_eq!(active.load(Ordering::Acquire), 2);
+        drop(first);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
 }
