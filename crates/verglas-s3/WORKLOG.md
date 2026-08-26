@@ -325,3 +325,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #171: Deleted the orphaned generated S3 Vector service model after removing its routes and Rust types. The retained crate contains only the S3-compatible object surface used by runtime infrastructure.
 - #171: Removed stale peer-hop, ring-routing, and cluster-of-one wording from the local S3 request, completion, and multipart paths. Request correlation remains scoped only to one runtime's cache and origin diagnostics.
 - #171: Added a one-bucket S3 proxy host for cloud Durable Objects. It accepts only preprovisioned bucket coordinates and separate origin/client credential files, so a Catalog object can expose its own SigV4 endpoint without receiving provider credentials.
+- #171: Removed the stale service-contract README left after deleting the generated
+  S3 OpenAPI document. Mintlify no longer attempts to load that nonexistent
+  legacy contract from the documentation configuration.

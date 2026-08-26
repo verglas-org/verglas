@@ -1,0 +1,81 @@
+---
+title: "Self-host Verglas"
+description: "Build and run the six Worker and Durable Object products with embedded Turso and an S3-compatible bucket."
+icon: "server"
+---
+
+Verglas runs as `edge → verglas-gateway → verglas-celld → verglas-runtime`.
+The runtime executes exactly six WASM product kinds: Worker, Durable Object,
+Stream, Pipeline, Sink, and Catalog. Infrastructure such as Foyer and the
+Iceberg commit capability does not add products.
+
+## Prerequisites
+
+You need the repository's pinned Rust toolchain, Node.js, and an HTTPS
+S3-compatible bucket. Python product builds additionally require the Python SDK
+environment under `sdks/worker-py`.
+
+The bucket stores immutable Parquet and Iceberg objects. Each Durable Object's
+embedded Turso database stays under the cell data root. No external Turso
+service or token is required.
+
+## Build the host processes
+
+From the repository root:
+
+```sh
+cargo build -p verglas-gateway -p verglas-celld -p verglas-runtime
+```
+
+This produces the three serving processes under `target/debug`.
+
+## Run the complete local stack
+
+The cold-restart harness builds real JavaScript or Python components, writes a
+run-scoped gateway manifest and host configuration, starts the production host
+processes, and verifies the full Worker → Durable Object → Stream → Pipeline →
+Sink → Catalog path.
+
+Configure one S3-compatible bucket without placing credentials in a manifest:
+
+```sh
+export VERGLAS_S3_BUCKET='<bucket>'
+export VERGLAS_S3_ENDPOINT='https://<s3-compatible-endpoint>'
+export VERGLAS_S3_ACCESS_KEY_ID='<access-key>'
+export VERGLAS_S3_SECRET_ACCESS_KEY='<secret-key>'
+```
+
+Run the JavaScript proof:
+
+```sh
+node examples/do-workers/cold-restart.mjs --language js
+```
+
+Run both supported language proofs when the Python SDK environment is ready:
+
+```sh
+node examples/do-workers/cold-restart.mjs --language both
+```
+
+Add `--keep` to retain the generated manifest, Turso databases, Foyer cache,
+and process logs for inspection. The harness prints the retained root. It never
+prints storage credentials.
+
+## Durability and authority
+
+- Embedded Turso is the sole authority for each Durable Object and for Catalog
+  visibility.
+- Runtime shutdown closes event admission, rejects a pending Stream outbox,
+  checkpoints the embedded WAL, and returns a nonzero status when the fence
+  fails.
+- Celld propagates a failed child shutdown instead of reporting success.
+- Foyer DRAM and NVMe contents are disposable and may refill from the configured
+  origin.
+- The runtime writes immutable Iceberg proposals. The Catalog Durable Object
+  publishes visible metadata through its SQLite transaction.
+- Tenant components receive no object-store credentials, filesystem preopens,
+  or raw network capability.
+
+See the [architecture overview](/docs/architecture/overview) and the [factual
+cold-restart transcript](/docs/architecture/do-workers) for the product and
+process boundaries.

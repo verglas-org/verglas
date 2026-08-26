@@ -25,9 +25,7 @@
           "docs/architecture/overview",
           "docs/architecture/whitepaper",
           "docs/architecture/rime",
-          "docs/architecture/cache",
           "docs/architecture/iceberg",
-          "docs/architecture/writes",
           "docs/architecture/execution",
           "docs/architecture/do-workers",
           "docs/architecture/primitives-platform",
@@ -61,8 +59,5 @@
   },
   "styling": {
     "eyebrows": "breadcrumbs"
-  },
-  "api": {
-    "openapi": "crates/verglas-s3/models/s3-openapi.json"
   }
 }
