@@ -522,14 +522,7 @@ async fn remote_fetch(
         .map_err(|error| GatewayError::InvalidHttp {
             message: format!("remote binding request URI is invalid: {error}"),
         })?;
-    let suffix = request_uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let target = format!(
-        "{origin}/do/{}/{}{suffix}",
-        percent_encode_segment(binding),
-        percent_encode_segment(object),
-    );
+    let target = remote_target(origin, binding, object, &request_uri);
     let method = reqwest::Method::from_bytes(event.method.as_bytes()).map_err(|error| {
         GatewayError::InvalidHttp {
             message: format!("remote binding method is invalid: {error}"),
@@ -584,6 +577,22 @@ async fn remote_fetch(
         body,
         accept_ws: None,
     })
+}
+
+/// Maps a binding fetch URL onto the internal route without adding a trailing
+/// slash that axum intentionally treats as a different route.
+fn remote_target(origin: &str, binding: &str, object: &str, request_uri: &Uri) -> String {
+    let base = format!(
+        "{origin}/do/{}/{}",
+        percent_encode_segment(binding),
+        percent_encode_segment(object),
+    );
+    let path = request_uri.path();
+    let suffix = if path == "/" { "" } else { path };
+    match request_uri.query() {
+        Some(query) => format!("{base}{suffix}?{query}"),
+        None => format!("{base}{suffix}"),
+    }
 }
 
 fn percent_encode_segment(value: &str) -> String {
@@ -1029,5 +1038,24 @@ mod activity_tests {
         assert_eq!(active.load(Ordering::Acquire), 1);
         drop(second);
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn remote_root_and_path_urls_match_axum_routes() {
+        let root = "/".parse::<Uri>().expect("root URI");
+        let root_query = "/?view=current".parse::<Uri>().expect("root query URI");
+        let path = "/incr?step=2".parse::<Uri>().expect("path URI");
+        assert_eq!(
+            remote_target("http://counter.flycast", "COUNTER", "global", &root),
+            "http://counter.flycast/do/COUNTER/global",
+        );
+        assert_eq!(
+            remote_target("http://counter.flycast", "COUNTER", "global", &root_query),
+            "http://counter.flycast/do/COUNTER/global?view=current",
+        );
+        assert_eq!(
+            remote_target("http://counter.flycast", "COUNTER", "global", &path),
+            "http://counter.flycast/do/COUNTER/global/incr?step=2",
+        );
     }
 }
