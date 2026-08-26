@@ -675,6 +675,8 @@ pub struct EventEndpoint {
     alarm_deadline: Option<u64>,
     /// Optional exact runtime-owned Catalog commit capability.
     catalog_commit: Option<Arc<dyn CatalogCommitService>>,
+    /// Whether component initialization completed through a live gateway router.
+    initialized: bool,
 }
 
 impl EventEndpoint {
@@ -725,6 +727,7 @@ impl EventEndpoint {
             sink,
             alarm_deadline: None,
             catalog_commit,
+            initialized: false,
         })
     }
 
@@ -733,10 +736,8 @@ impl EventEndpoint {
         &self.path
     }
 
-    /// Runs initialization once, arms the committed alarm, and serves connections.
+    /// Accepts the gateway router before initialization, then serves connections.
     pub async fn run(&mut self) -> Result<(), EventEndpointError> {
-        self.initialize().await?;
-        self.refresh_alarm().await?;
         loop {
             if let Some(deadline) = self.alarm_deadline {
                 let mut sleep = Box::pin(tokio::time::sleep(duration_until(deadline)));
@@ -759,7 +760,10 @@ impl EventEndpoint {
     }
 
     /// Commits the component initialization transaction before accepting events.
-    async fn initialize(&self) -> Result<(), EventEndpointError> {
+    async fn initialize(
+        &self,
+        bindings: Arc<dyn WorkerBindings>,
+    ) -> Result<(), EventEndpointError> {
         let (storage, sockets) = self.event_capabilities().await?;
         let pending = match self
             .dispatcher
@@ -767,7 +771,7 @@ impl EventEndpoint {
                 &self.gate,
                 Arc::clone(&storage) as Arc<dyn WorkerStorage>,
                 Arc::clone(&sockets) as Arc<dyn WorkerSockets>,
-                no_bindings(),
+                bindings,
             )
             .await
         {
@@ -808,6 +812,12 @@ impl EventEndpoint {
         self.store
             .set_runtime_stream_appender(Arc::new(BindingStreamAppender::new(router.clone())))
             .await;
+        if !self.initialized {
+            let binding_router: Arc<dyn WorkerBindings> = router.clone();
+            self.initialize(binding_router).await?;
+            self.refresh_alarm().await?;
+            self.initialized = true;
+        }
         let mut queued = VecDeque::new();
         loop {
             let frame = if let Some(frame) = queued.pop_front() {
