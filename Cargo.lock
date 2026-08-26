@@ -6720,6 +6720,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "verglas-backend",
+ "verglas-cache",
  "verglas-core",
 ]
 
