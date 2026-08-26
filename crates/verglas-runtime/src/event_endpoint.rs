@@ -815,7 +815,10 @@ impl EventEndpoint {
         let mut queued = VecDeque::new();
         if !self.initialized {
             let binding_router: Arc<dyn WorkerBindings> = router.clone();
-            let operation = self.initialize(binding_router);
+            let operation = async {
+                self.initialize(binding_router).await?;
+                Ok(Vec::new())
+            };
             let Some(frames) = wait_for_pending(
                 operation,
                 &mut reader,
