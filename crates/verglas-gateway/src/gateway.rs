@@ -390,26 +390,29 @@ fn activity_reporter_from_env() -> Option<ActivityReporter> {
     let active_requests = Arc::clone(&active);
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                event = receiver.recv() => {
-                    if event.is_none() {
-                        break;
-                    }
+        while receiver.recv().await.is_some() {
+            // The first request reports immediately. Subsequent begin/drop
+            // events are coalesced behind this two-second heartbeat so a busy
+            // Worker cannot turn the control plane into its request hot path.
+            loop {
+                let _ = client
+                    .post(&url)
+                    .header("x-verglas-cloud-internal", &token)
+                    .json(&serde_json::json!({
+                        "tenant_id": tenant,
+                        "worker_name": worker,
+                    }))
+                    .send()
+                    .await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let mut pending = false;
+                while receiver.try_recv().is_ok() {
+                    pending = true;
                 }
-                _ = heartbeat.tick(), if active_requests.load(Ordering::Acquire) > 0 => {}
+                if active_requests.load(Ordering::Acquire) == 0 && !pending {
+                    break;
+                }
             }
-            let _ = client
-                .post(&url)
-                .header("x-verglas-cloud-internal", &token)
-                .json(&serde_json::json!({
-                    "tenant_id": tenant,
-                    "worker_name": worker,
-                }))
-                .send()
-                .await;
         }
     });
     Some(ActivityReporter { events, active })
