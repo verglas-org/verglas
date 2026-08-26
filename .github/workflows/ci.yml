@@ -46,6 +46,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/worker-js/package-lock.json
+
+      - name: Install Worker SDK test dependencies
+        working-directory: sdks/worker-js
+        run: npm ci
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -89,6 +99,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/worker-js/package-lock.json
+
+      - name: Install Worker SDK test dependencies
+        working-directory: sdks/worker-js
+        run: npm ci
 
       - name: Coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
