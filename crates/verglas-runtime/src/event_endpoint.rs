@@ -812,13 +812,26 @@ impl EventEndpoint {
         self.store
             .set_runtime_stream_appender(Arc::new(BindingStreamAppender::new(router.clone())))
             .await;
+        let mut queued = VecDeque::new();
         if !self.initialized {
             let binding_router: Arc<dyn WorkerBindings> = router.clone();
-            self.initialize(binding_router).await?;
+            let operation = self.initialize(binding_router);
+            let Some(frames) = wait_for_pending(
+                operation,
+                &mut reader,
+                &mut write_half,
+                &router,
+                &mut outbound_receiver,
+                &mut queued,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            write_frames(&mut write_half, &frames).await?;
             self.refresh_alarm().await?;
             self.initialized = true;
         }
-        let mut queued = VecDeque::new();
         loop {
             let frame = if let Some(frame) = queued.pop_front() {
                 frame
