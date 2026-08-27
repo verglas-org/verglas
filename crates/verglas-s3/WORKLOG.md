@@ -328,3 +328,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #171: Removed the stale service-contract README left after deleting the generated
   S3 OpenAPI document. Mintlify no longer attempts to load that nonexistent
   legacy contract from the documentation configuration.
+- #175: Tightened the per-object S3 proxy startup contract and kept its reads on the shared Foyer path. The proxy exposes only the logical bucket and object-scoped client credentials while provider coordinates remain host-owned.

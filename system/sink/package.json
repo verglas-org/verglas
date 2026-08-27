@@ -2,6 +2,10 @@
   "name": "@verglas/system-sink",
   "private": true,
   "type": "module",
+  "devDependencies": {
+    "@verglas/worker-js": "^0.1.0",
+    "esbuild": "0.28.2"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs"
   }

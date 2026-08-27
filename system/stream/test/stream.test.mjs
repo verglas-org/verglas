@@ -6,12 +6,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { build as bundle } from '../../../sdks/worker-js/node_modules/esbuild/lib/main.js';
-import { createHandler, createWorker } from '../../../sdks/worker-js/src/cloudflare-workers.js';
+import { workerAssetPath } from '@verglas/worker-js/assets';
+import { createHandler, createWorker } from '@verglas/worker-js/cloudflare-workers';
+import { build as bundle } from 'esbuild';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
 const streamSource = join(root, 'worker.js');
-const cloudflareWorkersPath = resolve(root, '../../sdks/worker-js/src/cloudflare-workers.js');
+const cloudflareWorkersPath = workerAssetPath('cloudflare-workers.js');
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const MAX_READ_LIMIT = 1000;
@@ -19,6 +20,7 @@ const MAX_READ_LIMIT = 1000;
 class PersistedHost {
   constructor(path) {
     this.database = new DatabaseSync(path);
+    this.alarm = undefined;
   }
 
   sqlRows(statement) {
@@ -32,6 +34,18 @@ class PersistedHost {
 
   close() {
     this.database.close();
+  }
+
+  setAlarm(value) {
+    this.alarm = Number(value);
+  }
+
+  getAlarm() {
+    return this.alarm;
+  }
+
+  deleteAlarm() {
+    this.alarm = undefined;
   }
 }
 
@@ -73,6 +87,21 @@ async function append(handler, records, eventId) {
 
 async function readRecords(handler, after, limit) {
   const response = await handler.fetch(request('GET', `https://verglas.internal/stream/read?after=${after}&limit=${limit}`));
+  return { response, body: await body(response) };
+}
+
+async function consumerRequest(handler, action, consumerId, nextAfter) {
+  const payload = { consumer_id: consumerId, ...(nextAfter === undefined ? {} : { next_after: nextAfter }) };
+  const response = await handler.fetch(request(
+    'POST',
+    `https://verglas.internal/stream/consumers/${action}`,
+    JSON.stringify(payload),
+  ));
+  return { response, body: await body(response) };
+}
+
+async function retention(handler) {
+  const response = await handler.fetch(request('GET', 'https://verglas.internal/stream/retention'));
   return { response, body: await body(response) };
 }
 
@@ -130,6 +159,91 @@ test('Stream appends ordered records and gives independent bounded reads', async
   assert.deepEqual(second.body.records, [{ sequence: 3, record: { value: 3 } }]);
   const independent = await readRecords(handler, 0, 10);
   assert.deepEqual(independent.body.records.map(({ sequence }) => sequence), [1, 2, 3]);
+});
+
+test('Stream collects only through every explicit consumer acknowledgement', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-retention-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const handler = await makeHandler(loaded.project, host);
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  assert.equal((await consumerRequest(handler, 'register', 'pipeline-a')).response.status, 200);
+  assert.equal((await consumerRequest(handler, 'register', 'pipeline-b')).response.status, 200);
+  assert.deepEqual(await body(await append(
+    handler,
+    [{ value: 1 }, { value: 2 }, { value: 3 }],
+    JSON.stringify(['event-1', 'event-2', 'event-3']),
+  )), { accepted: 3, sequences: [1, 2, 3] });
+
+  assert.deepEqual((await consumerRequest(handler, 'ack', 'pipeline-a', 3)).body, {
+    consumer_id: 'pipeline-a', acknowledged_through: 3, retained_through: 0,
+  });
+  assert.deepEqual((await consumerRequest(handler, 'ack', 'pipeline-b', 1)).body, {
+    consumer_id: 'pipeline-b', acknowledged_through: 1, retained_through: 1,
+  });
+  assert.deepEqual(
+    host.database.prepare('SELECT sequence FROM stream_records ORDER BY sequence').all().map(({ sequence }) => Number(sequence)),
+    [2, 3],
+  );
+  assert.deepEqual((await consumerRequest(handler, 'ack', 'pipeline-b', 0)).body, {
+    consumer_id: 'pipeline-b', acknowledged_through: 1, retained_through: 1,
+  });
+  assert.equal((await consumerRequest(handler, 'ack', 'missing', 1)).response.status, 404);
+  assert.equal((await consumerRequest(handler, 'ack', 'pipeline-b', 4)).response.status, 400);
+
+  assert.deepEqual((await consumerRequest(handler, 'detach', 'pipeline-b')).body, {
+    consumer_id: 'pipeline-b', retained_through: 3,
+  });
+  assert.equal(host.database.prepare('SELECT COUNT(*) AS count FROM stream_records').get().count, 0);
+  assert.deepEqual((await retention(handler)).body, {
+    head_sequence: 3,
+    retained_through: 3,
+    consumers: [{ consumer_id: 'pipeline-a', acknowledged_through: 3 }],
+  });
+
+  const staleRead = await readRecords(handler, 0, 10);
+  assert.equal(staleRead.response.status, 410);
+  assert.equal(staleRead.body.retained_through, 3);
+  assert.deepEqual(await body(await append(handler, [{ value: 1 }], 'event-1')), {
+    accepted: 1,
+    sequences: [1],
+  });
+  assert.deepEqual(await body(await append(handler, [{ value: 4 }], 'event-4')), {
+    accepted: 1,
+    sequences: [4],
+  });
+  assert.deepEqual((await consumerRequest(handler, 'register', 'pipeline-late')).body, {
+    consumer_id: 'pipeline-late', acknowledged_through: 3, retained_through: 3,
+  });
+});
+
+test('Stream bounds each collection event and continues eligible work by alarm', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-stream-retention-budget-'));
+  const path = join(directory, 'stream.sqlite');
+  const loaded = await loadProject();
+  const host = new PersistedHost(path);
+  const handler = await makeHandler(loaded.project, host);
+  t.after(() => {
+    host.close();
+    return Promise.all([rm(directory, { recursive: true, force: true }), rm(loaded.directory, { recursive: true, force: true })]);
+  });
+
+  await consumerRequest(handler, 'register', 'pipeline');
+  const records = Array.from({ length: 1002 }, (_, sequence) => ({ sequence, payload: 'x'.repeat(256) }));
+  assert.equal((await append(handler, records)).status, 200);
+  assert.equal((await consumerRequest(handler, 'ack', 'pipeline', 1002)).body.retained_through, 1000);
+  assert.equal(host.database.prepare('SELECT COUNT(*) AS count FROM stream_records').get().count, 2);
+  assert.ok(host.alarm !== undefined);
+
+  await handler.alarm(host.alarm);
+  assert.equal((await retention(handler)).body.retained_through, 1002);
+  assert.equal(host.database.prepare('SELECT COUNT(*) AS count FROM stream_records').get().count, 0);
+  assert.equal(host.alarm, undefined);
 });
 
 test('producer event identity deduplicates with a stable acknowledgement', async (t) => {
@@ -385,8 +499,7 @@ test('structured schema configuration is immutable across restart and rejects un
     bindings: [{ name: 'STREAM_DO', class_name: 'Stream' }],
     vars: { STREAM_SCHEMA: changedSchema },
   }, { transport: secondHost });
-  await changed.init();
-  await assert.rejects(changed.fetch(request('GET', 'https://verglas.internal/stream/metrics')), /immutable Stream schema mismatch/i);
+  await assert.rejects(changed.init(), /immutable Stream schema mismatch/i);
 
   const unknownHost = new PersistedHost(':memory:');
   const unknown = createHandler(loaded.project, {

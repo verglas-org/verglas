@@ -15,6 +15,7 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::abi::{HostError, Request, Response, WitHandlerError, WorkerBindings, bindings};
+use crate::artifact::{ArtifactError, ComponentDigest, CwasmCache};
 use crate::runtime::configure_worker_engine;
 
 /// Routes a stateless Worker's flattened Durable Object stub call.
@@ -45,6 +46,13 @@ pub enum PoolError {
         /// The component compilation error.
         #[source]
         source: wasmtime::Error,
+    },
+    /// Reports a verified AOT cache read or deserialization failure.
+    #[error("failed to load Worker pool artifact: {source}")]
+    Artifact {
+        /// The cache or artifact error.
+        #[source]
+        source: ArtifactError,
     },
     /// Reports failure to register the pool host imports.
     #[error("failed to link Worker pool host imports: {source}")]
@@ -265,11 +273,28 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     /// Compiles component bytes and prepares the stateless host linker.
-    pub fn load(mut engine_config: Config, component_bytes: &[u8]) -> Result<Self, PoolError> {
+    pub fn load(engine_config: Config, component_bytes: &[u8]) -> Result<Self, PoolError> {
+        Self::load_with_cache(engine_config, None, component_bytes)
+    }
+
+    /// Loads a verified AOT component when a cache is configured.
+    ///
+    /// Supplying a cache makes cache failures fatal instead of silently
+    /// compiling tenant code inside a newly started cell.
+    pub fn load_with_cache(
+        mut engine_config: Config,
+        cache: Option<(&CwasmCache, ComponentDigest)>,
+        component_bytes: &[u8],
+    ) -> Result<Self, PoolError> {
         configure_worker_engine(&mut engine_config);
         let engine = Engine::new(&engine_config).map_err(|source| PoolError::Engine { source })?;
-        let component = Component::new(&engine, component_bytes)
-            .map_err(|source| PoolError::Component { source })?;
+        let component = match cache {
+            Some((cache, digest)) => cache
+                .load_or_compile(&engine, digest, component_bytes)
+                .map_err(|source| PoolError::Artifact { source })?,
+            None => Component::new(&engine, component_bytes)
+                .map_err(|source| PoolError::Component { source })?,
+        };
         Self::from_parts(engine, component)
     }
 
@@ -319,6 +344,32 @@ impl WorkerPool {
         request: Request,
     ) -> Result<Response, PoolError> {
         self.fetch(router, request).await
+    }
+
+    /// Executes one stateless Worker scheduled event with a fresh store and instance.
+    pub async fn scheduled(
+        &self,
+        router: Arc<dyn DoRouter>,
+        scheduled_epoch_millis: u64,
+        cron: String,
+    ) -> Result<(), PoolError> {
+        let host = PoolHost { router };
+        let mut store = Store::new(&self.engine, PoolStore::new(host));
+        let instance =
+            bindings::Service::instantiate_async(&mut store, &self.component, &self.linker)
+                .await
+                .map_err(|source| PoolError::Instantiation { source })?;
+        let result = instance
+            .verglas_do_worker_worker()
+            .call_scheduled(&mut store, scheduled_epoch_millis, &cron)
+            .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(PoolError::Handler {
+                message: error.message,
+            }),
+            Err(source) => Err(PoolError::Invocation { source }),
+        }
     }
 }
 

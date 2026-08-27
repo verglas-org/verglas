@@ -30,8 +30,17 @@ use crate::counters::CacheCounters;
 use crate::entry::{BlockEntryKey, CachedMeta};
 use crate::foyer_metrics::BlockCacheMetricsRegistry;
 
-/// Default disk framing added to one data block for Foyer's index and headers.
-const DISK_FRAMING_BYTES: usize = 16 * 1024;
+/// Worst-case serialized key/value framing reserved inside one Foyer segment.
+const DISK_ENTRY_FRAMING_BYTES: u64 = 16 * 1024;
+/// Foyer's normal physical eviction-segment size.
+///
+/// This is deliberately independent of `cache.data_block_bytes`: logical
+/// object blocks are packed together inside a segment and are only aligned to
+/// 4 KiB by Foyer. Coupling the two sizes created hundreds of tiny segment
+/// files for small-object workloads.
+const MAX_DISK_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Aim for at least this many segments when the configured device is small.
+const TARGET_DISK_SEGMENTS: u64 = 16;
 /// Per-entry accounting charged to the DRAM cache weighter.
 const ENTRY_OVERHEAD_BYTES: usize = 256;
 /// Maximum object-mapping cache budget. It is carved out of the configured DRAM
@@ -183,12 +192,7 @@ impl HybridCacheEngine {
         let dram = config.dram_bytes.0;
         let disk = config.capacity_bytes.0;
         let block_memory = block_memory_budget(dram)?;
-        let disk_block_bytes = checked_usize(block_bytes.saturating_add(DISK_FRAMING_BYTES as u64))
-            .ok_or(EngineError::DiskBudgetTooSmall(disk))?;
-        let minimum_disk = MIN_DISK_BLOCKS.saturating_mul(disk_block_bytes as u64);
-        if disk < minimum_disk {
-            return Err(EngineError::DiskBudgetTooSmall(disk));
-        }
+        let disk_segment_bytes = persistent_segment_bytes(block_bytes, disk)?;
         let disk_capacity = checked_usize(disk).ok_or(EngineError::DiskBudgetTooSmall(disk))?;
         let device = FsDeviceBuilder::new(&config.dir)
             .with_capacity(disk_capacity)
@@ -203,7 +207,7 @@ impl HybridCacheEngine {
             .memory(block_memory)
             .with_weighter(|_, value: &Bytes| value.len().saturating_add(ENTRY_OVERHEAD_BYTES))
             .storage()
-            .with_engine_config(BlockEngineConfig::new(device).with_block_size(disk_block_bytes))
+            .with_engine_config(BlockEngineConfig::new(device).with_block_size(disk_segment_bytes))
             .with_recover_mode(RecoverMode::Quiet)
             .build()
             .await
@@ -242,6 +246,28 @@ impl HybridCacheEngine {
     /// Waits for queued persistent writes to complete.
     pub async fn flush(&self) {
         self.inner.blocks.storage().wait().await;
+    }
+
+    /// Reads host-local recovery metadata from the same persistent Foyer
+    /// device that stores immutable origin blocks.
+    ///
+    /// This is deliberately not a second sidecar database. Callers use it for
+    /// small, disposable cursors whose loss only makes the next recovery walk
+    /// more immutable origin deltas.
+    pub async fn local_state(&self, key: &CacheKey) -> Option<Bytes> {
+        let key = local_state_key(key);
+        self.inner
+            .blocks
+            .get(&key)
+            .await
+            .ok()
+            .flatten()
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Replaces one disposable host-local recovery cursor in Foyer.
+    pub fn put_local_state(&self, key: CacheKey, value: Bytes) {
+        self.inner.blocks.insert(local_state_key(&key), value);
     }
 
     /// Resolves an object mapping from DRAM or the origin HEAD path.
@@ -528,6 +554,18 @@ fn block_key(key: &CacheKey, mapping: &CachedMeta, index: u64, block_bytes: u64)
     }
 }
 
+/// Names a disposable cursor in Foyer without colliding with an origin block.
+fn local_state_key(key: &CacheKey) -> BlockEntryKey {
+    BlockEntryKey {
+        block: BlockKey {
+            object: key.clone(),
+            etag: "verglas-local-state-v1".to_owned(),
+            block_bytes: 0,
+            block_index: 0,
+        },
+    }
+}
+
 /// Returns a cached block only when its length is exactly the requested length.
 fn valid_entry(
     entry: &HybridCacheEntry<BlockEntryKey, Bytes>,
@@ -587,7 +625,48 @@ fn block_memory_budget(dram: u64) -> Result<usize, EngineError> {
     checked_usize(block).ok_or(EngineError::DramBudgetTooSmall(dram))
 }
 
+/// Validates the budgets required to construct the Foyer cache.
+pub fn validate_cache_budgets(config: &CacheConfig) -> Result<(), EngineError> {
+    block_memory_budget(config.dram_bytes.0)?;
+    persistent_segment_bytes(config.data_block_bytes.0, config.capacity_bytes.0)?;
+    Ok(())
+}
+
+/// Chooses Foyer's physical eviction-segment size independently from the
+/// logical origin read-block size.
+fn persistent_segment_bytes(block_bytes: u64, disk: u64) -> Result<usize, EngineError> {
+    let minimum_segment = block_bytes.saturating_add(DISK_ENTRY_FRAMING_BYTES);
+    let preferred_segment = (disk / TARGET_DISK_SEGMENTS).min(MAX_DISK_SEGMENT_BYTES);
+    let segment = minimum_segment.max(preferred_segment);
+    let minimum_disk = MIN_DISK_BLOCKS.saturating_mul(segment);
+    if disk < minimum_disk {
+        return Err(EngineError::DiskBudgetTooSmall(disk));
+    }
+    checked_usize(segment).ok_or(EngineError::DiskBudgetTooSmall(disk))
+}
+
 /// Converts a validated byte budget to a platform-sized integer.
 fn checked_usize(value: u64) -> Option<usize> {
     usize::try_from(value).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_cache_uses_normal_foyer_segments_for_small_objects() {
+        assert_eq!(
+            persistent_segment_bytes(1024 * 1024, 256 * 1024 * 1024).expect("production geometry"),
+            16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn small_test_devices_retain_enough_room_for_one_logical_block() {
+        assert_eq!(
+            persistent_segment_bytes(1024 * 1024, 8 * 1024 * 1024).expect("small-device geometry"),
+            1024 * 1024 + 16 * 1024
+        );
+    }
 }

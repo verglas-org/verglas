@@ -5,11 +5,11 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { buildProject } from '../../../sdks/worker-js/bin/build.mjs';
+import { buildProject } from '@verglas/worker-js/build';
+import { workerToolPath } from '@verglas/worker-js/assets';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
-const sdk = resolve(root, '../../sdks/worker-js');
-const jco = join(sdk, 'node_modules/.bin/jco');
+const jco = workerToolPath('jco');
 
 test('Catalog builds as the Worker/DO service world without WASI', async (t) => {
   const output = await mkdtemp(join(tmpdir(), 'verglas-catalog-component-'));

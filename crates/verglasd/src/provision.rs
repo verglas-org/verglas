@@ -563,6 +563,8 @@ pub trait Provisioner: Send + Sync {
 /// Local child-process substrate used by development, tests, and `verglas-runtime`.
 #[derive(Debug, Clone, Default)]
 pub struct LocalProcessProvisioner {
+    /// Per-object S3-CAS and Foyer configuration passed to every DO child.
+    storage_host_config: Option<PathBuf>,
     /// Optional host-owned startup configuration exposed only to Catalog children.
     catalog_host_config: Option<PathBuf>,
 }
@@ -571,8 +573,20 @@ impl LocalProcessProvisioner {
     /// Creates the local process provisioner without Catalog startup configuration.
     pub const fn new() -> Self {
         Self {
+            storage_host_config: None,
             catalog_host_config: None,
         }
+    }
+
+    /// Configures the per-object storage path passed to every runtime child.
+    pub fn with_storage_host_config(mut self, path: impl Into<PathBuf>) -> Self {
+        self.storage_host_config = Some(path.into());
+        self
+    }
+
+    /// Returns the per-object storage configuration path, if any.
+    pub fn storage_host_config(&self) -> Option<&Path> {
+        self.storage_host_config.as_deref()
     }
 
     /// Configures the operator-owned path passed to Catalog runtime children.
@@ -679,6 +693,11 @@ impl Provisioner for LocalProcessProvisioner {
                 .kill_on_drop(true);
             if let Some(cache_dir) = request.component().cwasm_cache_dir() {
                 command.arg("--cwasm-cache-dir").arg(cache_dir);
+            }
+            if let Some(storage_host_config) = &self.storage_host_config {
+                command
+                    .arg("--storage-host-config")
+                    .arg(storage_host_config);
             }
             if let Some(catalog_host_config) = catalog_host_config {
                 command

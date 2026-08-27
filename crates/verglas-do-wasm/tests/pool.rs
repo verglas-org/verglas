@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use verglas_do_wasm::{DoRouter, HostError, Request, Response, WorkerPool};
+use verglas_do_wasm::{
+    ComponentDigest, CwasmCache, DoRouter, HostError, PoolError, Request, Response, WorkerPool,
+};
 
 /// Records the arguments supplied to a cross-component call.
 struct RecordingRouter;
@@ -41,6 +43,8 @@ fn worker_component() -> Vec<u8> {
                     i32.const 204
                     i32.store16 offset=8
                     i32.const 64)
+                (func (export "scheduled") (param i64 i32 i32) (result i32)
+                    i32.const 128)
                 (func (export "init") (result i32)
                     i32.const 128)
                 (func (export "alarm") (param i64) (result i32)
@@ -69,6 +73,10 @@ fn worker_component() -> Vec<u8> {
                 (param "request" $request)
                 (result $result)))
             (type $unit-result (result (error $error)))
+            (type $scheduled-type (func
+                (param "scheduled-epoch-millis" u64)
+                (param "cron" string)
+                (result $unit-result)))
             (type $init-type (func (result $unit-result)))
             (type $alarm-type (func (param "scheduled-epoch-millis" u64) (result $unit-result)))
             (type $message-type (func
@@ -88,6 +96,10 @@ fn worker_component() -> Vec<u8> {
             (func $init (type $init-type)
                 (canon lift (core func $m "init")
                     (memory (core memory $m "memory"))))
+            (func $scheduled (type $scheduled-type)
+                (canon lift (core func $m "scheduled")
+                    (memory (core memory $m "memory"))
+                    (realloc (func $m "realloc"))))
             (func $alarm (type $alarm-type)
                 (canon lift (core func $m "alarm")
                     (memory (core memory $m "memory"))))
@@ -103,7 +115,8 @@ fn worker_component() -> Vec<u8> {
                 (export "request" (type $request))
                 (export "response" (type $response))
                 (export "error" (type $error))
-                (export "fetch" (func $fetch)))
+                (export "fetch" (func $fetch))
+                (export "scheduled" (func $scheduled)))
             (export "verglas:do-worker/worker@0.1.0" (instance $worker))
             (instance $handler
                 (export "request" (type $request))
@@ -139,4 +152,43 @@ async fn worker_pool_fetch_api_accepts_router() {
     assert!(response.headers.is_empty());
     assert!(response.body.is_empty());
     assert_eq!(response.accept_ws, None);
+}
+
+/// A stateless Worker pool invokes the scheduled export with its exact logical time and expression.
+#[tokio::test]
+async fn worker_pool_scheduled_api_accepts_logical_event() {
+    let bytes = worker_component();
+    let pool = WorkerPool::load(wasmtime::Config::new(), &bytes).expect("component compiles");
+    pool.scheduled(
+        Arc::new(RecordingRouter),
+        1_800_000,
+        "*/5 * * * *".to_owned(),
+    )
+    .await
+    .expect("worker scheduled export succeeds");
+}
+
+/// A configured pool cache is the source of executable code after AOT upload.
+#[test]
+fn worker_pool_rejects_corrupt_configured_aot_cache() {
+    let bytes = worker_component();
+    let digest = ComponentDigest::compute(&bytes);
+    let root = tempfile::tempdir().expect("cache directory");
+    let cache = CwasmCache::new(root.path());
+    WorkerPool::load_with_cache(wasmtime::Config::new(), Some((&cache, digest)), &bytes)
+        .expect("initial AOT cache population");
+
+    let entry = std::fs::read_dir(root.path())
+        .expect("cache listing")
+        .next()
+        .expect("one cache entry")
+        .expect("cache entry")
+        .path();
+    std::fs::write(entry, b"not a precompiled component").expect("corrupt cache entry");
+
+    let error =
+        WorkerPool::load_with_cache(wasmtime::Config::new(), Some((&cache, digest)), &bytes)
+            .err()
+            .expect("corrupt AOT cache must fail closed");
+    assert!(matches!(error, PoolError::Artifact { .. }));
 }

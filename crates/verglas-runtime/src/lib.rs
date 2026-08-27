@@ -14,6 +14,8 @@ pub use catalog_commit::{
     MAX_CATALOG_COMMIT_BODY_BYTES,
 };
 pub use event_endpoint::{EventDispatcher, EventEndpoint, EventEndpointError};
-pub use host_config::{CatalogHostConfig, CatalogHostConfigError, CatalogOriginConfig, SinkFence};
+pub use host_config::{
+    CatalogHostConfig, CatalogHostConfigError, CatalogOriginConfig, DurableHostState, SinkFence,
+};
 pub use origin_storage::{OriginStorageConfig, OriginStorageError, OriginStorageFactory};
 pub use worker_storage::{BindingStreamAppender, TursoWorkerStorage};

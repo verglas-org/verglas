@@ -60,3 +60,4 @@ Append-only log of changes to this crate, by issue.
 - #171: Renamed the supervisor crate and executable from the ambiguous
   `verglas-celld` name to `verglasd`. The control socket, package imports,
   diagnostics, and tests use the new name with no binary or CLI alias.
+- #175: Added per-object storage configuration to the supervisor process contract and forward it to every product child. Catalog retains its separate narrow Iceberg capability flag, but Stream and ordinary Durable Objects can no longer omit S3-CAS storage.

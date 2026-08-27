@@ -13,7 +13,7 @@ credentials.
 ```text
 $ node --version
 v25.5.0
-$ sdks/worker-py/.venv/bin/python --version
+$ python --version
 Python 3.13.12
 $ cargo --version
 cargo 1.96.1 (356927216 2026-06-26)

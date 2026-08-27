@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 verglas-core.workspace = true
 verglas-backend.workspace = true
+verglas-cache.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64 = "0.22.1"

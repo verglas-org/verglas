@@ -7,8 +7,12 @@
 import { DurableObject } from 'cloudflare:workers';
 
 export const PROCESS_PATH = '/pipeline/process-now';
+export const ENQUEUE_PATH = '/pipeline/enqueue';
+export const ENQUEUE_DISPATCH_DELAY_MS = 100;
 export const STATUS_PATH = '/pipeline/status';
 export const STREAM_READ_PATH = '/stream/read';
+export const STREAM_REGISTER_PATH = '/stream/consumers/register';
+export const STREAM_ACK_PATH = '/stream/consumers/ack';
 export const SINK_BATCH_PATH = '/sink/batch';
 export const MAX_STREAM_READ = 1000;
 export const MAX_BATCH_ROWS = 10_000;
@@ -43,7 +47,7 @@ const SCALAR_FUNCTIONS = new Set([
 async function fetch(request, env) {
   const url = new URL(request.url);
   const method = request.method.toUpperCase();
-  const allowed = (method === 'POST' && url.pathname === PROCESS_PATH)
+  const allowed = (method === 'POST' && (url.pathname === PROCESS_PATH || url.pathname === ENQUEUE_PATH))
     || (method === 'GET' && url.pathname === STATUS_PATH);
   if (!allowed) return new Response('not found', { status: 404 });
 
@@ -100,6 +104,7 @@ export class Pipeline extends DurableObject {
     if (this.#initError) throw this.#initError;
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
+    if (method === 'POST' && url.pathname === ENQUEUE_PATH) return this.#enqueue();
     if (method === 'POST' && url.pathname === PROCESS_PATH) return this.#processNow();
     if (method === 'GET' && url.pathname === STATUS_PATH) return this.#statusResponse();
     return new Response('not found', { status: 404 });
@@ -114,10 +119,25 @@ export class Pipeline extends DurableObject {
     await this.#ready;
     if (this.#initError) throw this.#initError;
     try {
+      const before = await loadCursor(this.ctx);
       await this.#processOnce(true);
+      if (await loadCursor(this.ctx) > before) await this.ctx.storage.setAlarm(Date.now());
     } catch (error) {
       await this.#scheduleRetry(error);
     }
+  }
+
+  /**
+   * Durably inserts one processing intent and acknowledges without waiting on
+   * any downstream binding. The object alarm owns all downstream progress.
+   * @returns {Promise<Response>}
+   */
+  async #enqueue() {
+    // Verglas may dispatch an alarm as soon as its timestamp is due. Leave a
+    // small dispatch gap so the 202 body is flushed before this object can be
+    // reacquired for downstream work.
+    await this.ctx.storage.setAlarm(Date.now() + ENQUEUE_DISPATCH_DELAY_MS);
+    return jsonResponse({ pipeline_id: this.#config.pipelineId, queued: true }, 202);
   }
 
   /**
@@ -141,6 +161,12 @@ export class Pipeline extends DurableObject {
    * @returns {Promise<object>}
    */
   async #processOnce(forceFlush) {
+    await registerSource(this.env, this.#config);
+    const cursor = await loadCursor(this.ctx);
+    // This catch-up acknowledgment is deliberately after the durable cursor
+    // read. If the previous event committed its cursor and lost the remote
+    // acknowledgment, retry only delays Stream collection.
+    await acknowledgeSource(this.env, this.#config, cursor);
     const pending = await loadPending(this.ctx);
     if (pending) {
       if (!forceFlush && Date.now() < pending.flush_at) return this.#status();
@@ -148,18 +174,22 @@ export class Pipeline extends DurableObject {
       return this.#status();
     }
 
-    const cursor = await loadCursor(this.ctx);
     const source = await readSource(this.env, this.#config, cursor);
     if (source.records.length === 0) {
+      if (source.nextAfter > cursor) {
+        await execute(this.ctx, `UPDATE ${CURSOR_TABLE} SET next_sequence = ? WHERE id = 1`, source.nextAfter);
+        await acknowledgeSource(this.env, this.#config, source.nextAfter);
+      }
       await this.ctx.storage.deleteAlarm();
       return this.#status();
     }
 
     const assembled = assembleBatch(this.#config, source.records);
+    const consumedEntireRead = assembled.nextAfter === source.records.at(-1).sequence;
     const pendingBatch = {
       first_sequence: assembled.firstSequence,
       last_sequence: assembled.lastSequence,
-      next_after: assembled.nextAfter,
+      next_after: consumedEntireRead ? source.nextAfter : assembled.nextAfter,
       flush_at: Date.now() + this.#config.batchMaxSeconds * 1000,
       retry_count: 0,
       sink_batches: assembled.sinkBatches,
@@ -199,6 +229,7 @@ export class Pipeline extends DurableObject {
     await execute(this.ctx, `UPDATE ${CURSOR_TABLE} SET next_sequence = ? WHERE id = 1`, pending.next_after);
     await execute(this.ctx, `DELETE FROM ${BATCH_TABLE} WHERE id = 1`);
     await this.ctx.storage.deleteAlarm();
+    await acknowledgeSource(this.env, this.#config, pending.next_after);
   }
 
   /**
@@ -405,23 +436,67 @@ async function readSource(env, config, after) {
   const value = await responseJson(response, 'Stream read');
   if (!value || !Array.isArray(value.records)) throw new Error('Stream read response must contain records[]');
   const records = [];
-  let expected = after + 1;
+  const positions = new Map();
+  let previousRecord = after;
   for (const item of value.records) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Stream read record envelope must be an object');
     const sequence = safeSequence(item.sequence, 'Stream sequence');
-    if (sequence !== expected) throw new Error(`Stream read is not contiguous at sequence ${sequence}; expected ${expected}`);
+    if (sequence <= previousRecord) throw new Error('Stream read records must be strictly ordered');
     if (!Object.hasOwn(item, 'record')) throw new Error('Stream read record envelope is missing record');
     assertJsonValue(item.record, new WeakSet());
     records.push({ sequence, record: item.record });
-    expected += 1;
+    positions.set(sequence, 'record');
+    previousRecord = sequence;
   }
+  const skipped = value.skipped === undefined ? [] : value.skipped;
+  if (!Array.isArray(skipped)) throw new Error('Stream read skipped must be an array');
+  let previousSkipped = after;
+  for (const item of skipped) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Stream skipped envelope must be an object');
+    const sequence = safeSequence(item.sequence, 'Stream skipped sequence');
+    if (sequence <= previousSkipped) throw new Error('Stream skipped positions must be strictly ordered');
+    if (typeof item.family !== 'string' || item.family.length === 0) throw new Error('Stream skipped family must be a non-empty string');
+    if (positions.has(sequence)) throw new Error(`Stream position ${sequence} is both a record and skipped`);
+    positions.set(sequence, 'skipped');
+    previousSkipped = sequence;
+  }
+  const lastPosition = positions.size === 0 ? after : Math.max(...positions.keys());
   const nextAfter = value.next_after === undefined
-    ? (records.length === 0 ? after : records.at(-1).sequence)
+    ? lastPosition
     : safeSequence(value.next_after, 'Stream next_after');
-  if (nextAfter !== (records.length === 0 ? after : records.at(-1).sequence)) {
-    throw new Error('Stream read next_after does not match its last sequence');
+  if (nextAfter !== lastPosition) {
+    throw new Error('Stream read next_after does not match its last returned position');
+  }
+  for (let sequence = after + 1; sequence <= nextAfter; sequence += 1) {
+    if (!positions.has(sequence)) throw new Error(`Stream read is not contiguous at sequence ${sequence}`);
   }
   return { records, nextAfter };
+}
+
+/** Idempotently registers this Pipeline as an explicit Stream retention consumer. */
+async function registerSource(env, config) {
+  const request = new Request(`https://verglas.internal${STREAM_REGISTER_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ consumer_id: config.pipelineId }),
+  });
+  const response = await bindingFetch(env[config.sourceBinding], config.sourceName, request);
+  if (!response || response.status < 200 || response.status >= 300) {
+    throw new Error(`Stream did not register Pipeline ${config.pipelineId}: HTTP ${response?.status ?? 'unknown'}`);
+  }
+}
+
+/** Publishes a retention acknowledgment only for an already-durable cursor. */
+async function acknowledgeSource(env, config, nextAfter) {
+  const request = new Request(`https://verglas.internal${STREAM_ACK_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ consumer_id: config.pipelineId, next_after: nextAfter }),
+  });
+  const response = await bindingFetch(env[config.sourceBinding], config.sourceName, request);
+  if (!response || response.status < 200 || response.status >= 300) {
+    throw new Error(`Stream did not retain Pipeline ${config.pipelineId} through ${nextAfter}: HTTP ${response?.status ?? 'unknown'}`);
+  }
 }
 
 /**

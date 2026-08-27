@@ -2,6 +2,9 @@
   "name": "js-cold-chain",
   "main": "worker.js",
   "compatibility_date": "2025-01-01",
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "durable_objects": {
     "bindings": [
       { "name": "COUNTER", "class_name": "Counter" }

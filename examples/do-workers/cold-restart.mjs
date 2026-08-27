@@ -26,13 +26,14 @@ import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createConnection } from 'node:net';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const HERE = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const REPO = resolve(HERE, '../..');
-const JS_BUILDER = join(REPO, 'sdks/worker-js/bin/build.mjs');
-const PY_BUILDER = join(REPO, 'sdks/worker-py/build.py');
-const PYTHON = join(REPO, 'sdks/worker-py/.venv/bin/python');
+const REQUIRE = createRequire(import.meta.url);
+const JS_BUILDER = REQUIRE.resolve('@verglas/worker-js/build');
+const PY_BUILDER = 'verglas-worker-py-build';
 const PRODUCTS = ['stream', 'pipeline', 'sink', 'catalog'];
 const PRODUCT_DIRS = Object.fromEntries(PRODUCTS.map((product) => [
   product,
@@ -247,10 +248,10 @@ async function buildArtifacts(language, root, deployment) {
   const workerProject = join(REPO, 'examples/do-workers', `${language}-cold-chain`);
   const workerOutput = join(buildRoot, 'worker');
   await mkdir(workerOutput, { recursive: true });
-  const builder = language === 'js' ? process.execPath : PYTHON;
+  const builder = language === 'js' ? process.execPath : PY_BUILDER;
   const builderArgs = language === 'js'
     ? [JS_BUILDER, workerProject, '--out', workerOutput]
-    : [PY_BUILDER, workerProject, '--out', workerOutput];
+    : [workerProject, '--out', workerOutput];
   await runCommand(
     builder,
     builderArgs,
@@ -465,7 +466,13 @@ async function requireJson(base, path, method) {
 async function assertProgress(base, count) {
   const counter = await requireJson(base, '/', 'GET');
   if (counter.count !== count) throw new Error(`counter count ${counter.count} did not equal ${count}`);
-  const pipeline = await requireJson(base, '/pipeline-status', 'GET');
+  let pipeline;
+  const deadline = Date.now() + 10_000;
+  do {
+    pipeline = await requireJson(base, '/pipeline-status', 'GET');
+    if (pipeline.cursor === count && pipeline.pending === false) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
   if (pipeline.cursor !== count || pipeline.pending !== false) {
     throw new Error(`pipeline did not confirm cursor ${count}: ${JSON.stringify(pipeline)}`);
   }
@@ -538,9 +545,10 @@ async function runLanguage(built, gatewayBin, verglasdBin, runtimeBin, runtimeHo
     await start();
     await assertProgress(base, 2);
     const replay = await requireJson(base, '/process', 'POST');
-    if (replay.cursor !== 2 || replay.pending !== false) {
-      throw new Error(`post-restart replay changed progress: ${JSON.stringify(replay)}`);
+    if (replay.queued !== true) {
+      throw new Error(`post-restart enqueue was not acknowledged: ${JSON.stringify(replay)}`);
     }
+    await assertProgress(base, 2);
     return { language: built.language, manifestPath, dataRoot, logs };
   } finally {
     await stopProcess(gateway);

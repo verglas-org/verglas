@@ -28,3 +28,17 @@
 - #171: Renamed the supervisor client to `VerglasdSpawner` and the gateway option
   to `--verglasd-control`. The former daemon name is rejected rather than
   retained as a compatibility alias.
+- #179: Added Vectorize as the seventh strict artifact product and parsed Cloudflare `vectorize` bindings with fixed index identities and optional remote origins. Gateway selection now routes each declared Vectorize binding only to its Vectorize artifact and rejects missing artifacts, wrong identities, unknown keys, and cross-kind name collisions.
+- #180: Added Graph as the eighth strict artifact product with fixed graph identities and optional remote origins. Gateway selection routes each `graphs` binding only to its Graph artifact and rejects missing artifacts, wrong identities, unknown keys, and cross-product binding collisions.
+- #181: Added Query as the ninth strict artifact product with fixed materialization identities and optional remote origins. Gateway selection routes every `queries` binding only to its Query artifact and rejects missing artifacts, wrong identities, unknown keys, and cross-product collisions.
+- #182: Added Skill as the tenth strict artifact product with fixed skill identities and optional remote origins. Gateway selection routes every `skills` binding only to its Skill artifact and rejects wrong identities, unknown keys, and cross-product binding collisions.
+- #182: Removed the Skill artifact and binding from the gateway after making MCP skill servers ordinary stateless Worker artifacts. The strict manifest now rejects the retired `skills` key and routes deployed bundles through the existing Worker path.
+- #0: Added a private scheduled-event gateway route authenticated by both deployment ingress identity and the control-plane activity token. It renews the Machine activity lease and invokes the stateless Worker scheduled export without disguising cron events as HTTP fetches.
+- #182: Finalized removal of the abandoned MCP server design. The gateway exposes no Skill product or binding, and manifests containing the former `skills` key remain invalid.
+- #0: Added the managed-edge hibernating WebSocket event boundary. Cloudflare
+  owns the client transport while private open/message/close routes restore the
+  guest logical socket from edge-carried object metadata, wait for terminal
+  commit/error frames, and return committed effects through an authenticated
+  callback. Focused coverage proves no persistent upstream socket is required.
+- #0: Extended the aggregate product-routing acceptance matrix to include Query alongside Worker, Durable Object, Stream, Pipeline, Sink, Catalog, Vectorize, and Graph. The gateway test now proves Query selects its own immutable artifact and preserves the same restart identity across spawns.
+- #0: Resolve the JavaScript component builder from the published `@verglas/worker-js` tool instead of a repository-local SDK tree. The gateway acceptance test now follows the same packaged authoring path used by customers.

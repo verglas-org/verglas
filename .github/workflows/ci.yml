@@ -52,21 +52,15 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace --all-features
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: sdks/typescript/package-lock.json
 
-      - name: TypeScript SDK
-        working-directory: sdks/typescript
-        run: |
-          npm ci
-          npm test
-          npm run typecheck
+      - name: Install the published Worker builder
+        run: npm install --global @verglas/worker-js@0.1.0
+
+      - name: Test
+        run: cargo test --workspace --all-features
 
       - name: RIME plugin
         working-directory: rime

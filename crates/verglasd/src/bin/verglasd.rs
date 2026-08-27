@@ -19,6 +19,8 @@ struct Config {
     management_bind: Option<SocketAddr>,
     /// Optional operator-owned startup configuration for Catalog runtime children.
     catalog_host_config: Option<PathBuf>,
+    /// Per-object S3-CAS/Foyer configuration passed to every runtime child.
+    storage_host_config: Option<PathBuf>,
 }
 
 impl Config {
@@ -31,6 +33,7 @@ impl Config {
         let mut control_socket = None;
         let mut management_bind = None;
         let mut catalog_host_config = None;
+        let mut storage_host_config = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--host-id" => host_id = Some(next_value(&mut arguments, "--host-id")?),
@@ -53,6 +56,12 @@ impl Config {
                         "--catalog-host-config",
                     )?));
                 }
+                "--storage-host-config" => {
+                    storage_host_config = Some(PathBuf::from(next_value(
+                        &mut arguments,
+                        "--storage-host-config",
+                    )?));
+                }
                 "--help" => return Err(usage().to_owned()),
                 other => return Err(format!("unknown argument {other}\n{}", usage())),
             }
@@ -64,6 +73,7 @@ impl Config {
             control_socket,
             management_bind,
             catalog_host_config,
+            storage_host_config,
         })
     }
 
@@ -87,7 +97,7 @@ fn next_value(
 
 /// Returns the one supported command-line shape.
 fn usage() -> &'static str {
-    "usage: verglasd --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT] [--catalog-host-config PATH]"
+    "usage: verglasd --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT] [--storage-host-config PATH] [--catalog-host-config PATH]"
 }
 
 /// Runs the control endpoint until termination or a fatal socket error.
@@ -101,10 +111,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let control_path = config.control_path();
-    let provisioner = match config.catalog_host_config {
-        Some(path) => LocalProcessProvisioner::new().with_catalog_host_config(path),
-        None => LocalProcessProvisioner::new(),
-    };
+    let mut provisioner = LocalProcessProvisioner::new();
+    if let Some(path) = config.storage_host_config {
+        provisioner = provisioner.with_storage_host_config(path);
+    }
+    if let Some(path) = config.catalog_host_config {
+        provisioner = provisioner.with_catalog_host_config(path);
+    }
     let supervisor = Arc::new(Mutex::new(HostSupervisor::with_provisioner(
         HostId::new(config.host_id),
         &config.root,

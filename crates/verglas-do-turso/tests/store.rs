@@ -60,6 +60,336 @@ async fn sql_create_insert_update_delete_select() -> Result<(), verglas_do_turso
     Ok(())
 }
 
+/// Embedded Turso checkpoints vector state atomically and exposes every required distance function.
+#[tokio::test]
+async fn native_vector_values_and_distance_are_available() -> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("worker.db");
+    let store = TursoStore::open(&path, "worker-test").await?;
+    let event = store.begin_event().await?;
+    event
+        .execute(
+            "CREATE TABLE vectors (id TEXT PRIMARY KEY, embedding F32_BLOB(3), metadata_json TEXT)",
+        )
+        .await?;
+    event
+        .execute("CREATE TABLE receipts (mutation_id TEXT PRIMARY KEY)")
+        .await?;
+    event
+        .execute("CREATE TABLE metadata_indexes (property_name TEXT PRIMARY KEY)")
+        .await?;
+    event
+        .execute("INSERT INTO vectors VALUES ('a', vector32('[1,0,0]'), '{\"kind\":\"doc\"}')")
+        .await?;
+    event
+        .execute("INSERT INTO receipts VALUES ('mutation-a')")
+        .await?;
+    event
+        .execute("INSERT INTO metadata_indexes VALUES ('kind')")
+        .await?;
+    event.commit().await?;
+    drop(store);
+
+    let reopened = TursoStore::open(&path, "worker-test").await?;
+    let event = reopened.begin_event().await?;
+    let rows = event
+        .query_json(
+            "SELECT id, vector_extract(embedding) AS embedding_json,
+                    vector_distance_cos(embedding, vector32('[1,0,0]')) AS cosine,
+                    vector_distance_l2(embedding, vector32('[1,0,0]')) AS euclidean,
+                    vector_distance_dot(embedding, vector32('[1,0,0]')) AS dot_product,
+                    json_extract(metadata_json, '$.\"kind\"') AS kind
+             FROM vectors WHERE json_extract(metadata_json, '$.\"kind\"') = 'doc'",
+        )
+        .await?;
+    assert_eq!(rows[0]["id"], json!("a"));
+    assert_eq!(rows[0]["embedding_json"], json!("[1,0,0]"));
+    assert!(
+        rows[0]["cosine"]
+            .as_f64()
+            .is_some_and(|value| value.abs() < 0.000_001)
+    );
+    assert!(
+        rows[0]["euclidean"]
+            .as_f64()
+            .is_some_and(|value| value.abs() < 0.000_001)
+    );
+    assert!(
+        rows[0]["dot_product"]
+            .as_f64()
+            .is_some_and(|value| (value + 1.0).abs() < 0.000_001)
+    );
+    assert_eq!(rows[0]["kind"], json!("doc"));
+    event.rollback().await?;
+
+    let failed = reopened.begin_event().await?;
+    failed
+        .execute("INSERT INTO vectors VALUES ('b', vector32('[0,1,0]'), NULL)")
+        .await?;
+    failed
+        .execute("INSERT INTO receipts VALUES ('mutation-b')")
+        .await?;
+    failed
+        .execute("INSERT INTO metadata_indexes VALUES ('temporary')")
+        .await?;
+    failed.rollback().await?;
+    drop(reopened);
+
+    let reopened = TursoStore::open(&path, "worker-test").await?;
+    let event = reopened.begin_event().await?;
+    assert_eq!(
+        event
+            .query_json("SELECT id FROM vectors ORDER BY id")
+            .await?,
+        json!([{ "id": "a" }])
+    );
+    assert_eq!(
+        event
+            .query_json("SELECT mutation_id FROM receipts ORDER BY mutation_id")
+            .await?,
+        json!([{ "mutation_id": "mutation-a" }])
+    );
+    assert_eq!(
+        event
+            .query_json("SELECT property_name FROM metadata_indexes ORDER BY property_name")
+            .await?,
+        json!([{ "property_name": "kind" }])
+    );
+    event.rollback().await?;
+    Ok(())
+}
+
+/// Embedded Turso persists graph state atomically and plans both adjacency directions by index.
+#[tokio::test]
+async fn graph_adjacency_indexes_survive_reopen_and_cover_both_directions()
+-> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("worker.db");
+    let store = TursoStore::open(&path, "graph-test").await?;
+    let event = store.begin_event().await?;
+    event
+        .execute(
+            "CREATE TABLE graph_nodes (
+                external_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+                properties_json TEXT, mutation_id TEXT NOT NULL)",
+        )
+        .await?;
+    event
+        .execute(
+            "CREATE TABLE graph_edges (
+                external_id TEXT PRIMARY KEY, from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL, kind TEXT NOT NULL,
+                properties_json TEXT, mutation_id TEXT NOT NULL)",
+        )
+        .await?;
+    event
+        .execute(
+            "CREATE TABLE graph_mutations (
+                mutation_id TEXT PRIMARY KEY, operation TEXT NOT NULL)",
+        )
+        .await?;
+    event
+        .execute(
+            "CREATE TABLE graph_property_indexes (
+                scope TEXT NOT NULL, property_name TEXT NOT NULL,
+                index_type TEXT NOT NULL, PRIMARY KEY(scope, property_name))",
+        )
+        .await?;
+    event
+        .execute(
+            "CREATE INDEX graph_edges_out
+             ON graph_edges(from_id, kind, to_id, external_id)",
+        )
+        .await?;
+    event
+        .execute(
+            "CREATE INDEX graph_edges_in
+             ON graph_edges(to_id, kind, from_id, external_id)",
+        )
+        .await?;
+    event
+        .execute(
+            "INSERT INTO graph_nodes VALUES
+             ('a', 'person', '{\"rank\":1}', 'mutation-a'),
+             ('b', 'person', '{\"rank\":2}', 'mutation-a')",
+        )
+        .await?;
+    event
+        .execute(
+            "INSERT INTO graph_edges VALUES
+             ('ab', 'a', 'b', 'knows', '{\"trust\":0.9}', 'mutation-a')",
+        )
+        .await?;
+    event
+        .execute("INSERT INTO graph_mutations VALUES ('mutation-a', 'upsert')")
+        .await?;
+    event
+        .execute("INSERT INTO graph_property_indexes VALUES ('node', 'rank', 'number')")
+        .await?;
+    event.commit().await?;
+    drop(store);
+
+    let reopened = TursoStore::open(&path, "graph-test").await?;
+    let event = reopened.begin_event().await?;
+    let outbound = event
+        .query_json(
+            "EXPLAIN QUERY PLAN
+             SELECT external_id FROM graph_edges
+             WHERE from_id = 'a' AND kind = 'knows'
+             ORDER BY from_id, kind, to_id, external_id",
+        )
+        .await?;
+    let inbound = event
+        .query_json(
+            "EXPLAIN QUERY PLAN
+             SELECT external_id FROM graph_edges
+             WHERE to_id = 'b' AND kind = 'knows'
+             ORDER BY to_id, kind, from_id, external_id",
+        )
+        .await?;
+    assert!(plan_mentions(&outbound, "graph_edges_out"));
+    assert!(plan_mentions(&inbound, "graph_edges_in"));
+    assert_eq!(
+        event
+            .query_json(
+                "SELECT external_id AS id FROM graph_edges
+                 WHERE from_id = 'a' AND kind = 'knows'",
+            )
+            .await?,
+        json!([{ "id": "ab" }])
+    );
+    event.rollback().await?;
+
+    let failed = reopened.begin_event().await?;
+    failed
+        .execute("INSERT INTO graph_nodes VALUES ('c', 'person', NULL, 'mutation-b')")
+        .await?;
+    failed
+        .execute("INSERT INTO graph_mutations VALUES ('mutation-b', 'upsert')")
+        .await?;
+    failed
+        .execute("INSERT INTO graph_property_indexes VALUES ('edge', 'trust', 'number')")
+        .await?;
+    failed.rollback().await?;
+    drop(reopened);
+
+    let reopened = TursoStore::open(&path, "graph-test").await?;
+    let event = reopened.begin_event().await?;
+    assert_eq!(
+        event
+            .query_json("SELECT external_id AS id FROM graph_nodes ORDER BY external_id")
+            .await?,
+        json!([{ "id": "a" }, { "id": "b" }])
+    );
+    assert_eq!(
+        event
+            .query_json("SELECT mutation_id FROM graph_mutations ORDER BY mutation_id")
+            .await?,
+        json!([{ "mutation_id": "mutation-a" }])
+    );
+    assert_eq!(
+        event
+            .query_json(
+                "SELECT scope, property_name FROM graph_property_indexes
+                 ORDER BY scope, property_name",
+            )
+            .await?,
+        json!([{ "scope": "node", "property_name": "rank" }])
+    );
+    event.rollback().await?;
+    Ok(())
+}
+
+/// Returns whether one JSON query plan names the expected index.
+fn plan_mentions(plan: &serde_json::Value, index: &str) -> bool {
+    plan.as_array().is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.as_object().is_some_and(|columns| {
+                columns
+                    .values()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|value| value.contains(index))
+            })
+        })
+    })
+}
+
+/// Embedded Turso atomically persists Query rows, receipts, watermarks, and endpoint indexes.
+#[tokio::test]
+async fn query_materialization_survives_reopen_and_uses_endpoint_index()
+-> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("worker.db");
+    let store = TursoStore::open(&path, "query-test").await?;
+    let event = store.begin_event().await?;
+    event.execute("CREATE TABLE query_view_rows (view_name TEXT NOT NULL, group_key TEXT NOT NULL, dimensions_json TEXT NOT NULL, measures_json TEXT NOT NULL, PRIMARY KEY(view_name, group_key))").await?;
+    event.execute("CREATE TABLE query_batch_receipts (batch_id TEXT PRIMARY KEY, payload_digest TEXT NOT NULL)").await?;
+    event.execute("CREATE TABLE query_source_watermarks (source TEXT PRIMARY KEY, last_sequence INTEGER NOT NULL)").await?;
+    event.execute("CREATE INDEX query_endpoint_sales_by_day ON query_view_rows(view_name, json_extract(dimensions_json, '$.region'), group_key)").await?;
+    event.execute("INSERT INTO query_view_rows VALUES ('daily_sales', '[\"2026-08-26\",\"west\"]', '{\"day\":\"2026-08-26\",\"region\":\"west\"}', '{\"revenue\":25}')").await?;
+    event
+        .execute("INSERT INTO query_batch_receipts VALUES ('batch-1', 'digest-1')")
+        .await?;
+    event
+        .execute("INSERT INTO query_source_watermarks VALUES ('orders', 3)")
+        .await?;
+    event.commit().await?;
+    drop(store);
+
+    let reopened = TursoStore::open(&path, "query-test").await?;
+    let event = reopened.begin_event().await?;
+    let plan = event.query_json("EXPLAIN QUERY PLAN SELECT measures_json FROM query_view_rows INDEXED BY query_endpoint_sales_by_day WHERE view_name = 'daily_sales' AND json_extract(dimensions_json, '$.region') = 'west' ORDER BY group_key").await?;
+    assert!(plan_mentions(&plan, "query_endpoint_sales_by_day"));
+    assert_eq!(
+        event
+            .query_json(
+                "SELECT json_extract(measures_json, '$.revenue') AS revenue FROM query_view_rows"
+            )
+            .await?,
+        json!([{ "revenue": 25 }])
+    );
+    assert_eq!(
+        event
+            .query_json("SELECT batch_id FROM query_batch_receipts")
+            .await?,
+        json!([{ "batch_id": "batch-1" }])
+    );
+    assert_eq!(
+        event
+            .query_json("SELECT source, last_sequence FROM query_source_watermarks")
+            .await?,
+        json!([{ "source": "orders", "last_sequence": 3 }])
+    );
+    event.rollback().await?;
+
+    let failed = reopened.begin_event().await?;
+    failed
+        .execute("INSERT INTO query_batch_receipts VALUES ('batch-2', 'digest-2')")
+        .await?;
+    failed
+        .execute("UPDATE query_source_watermarks SET last_sequence = 4 WHERE source = 'orders'")
+        .await?;
+    failed.rollback().await?;
+    drop(reopened);
+
+    let reopened = TursoStore::open(&path, "query-test").await?;
+    let event = reopened.begin_event().await?;
+    assert_eq!(
+        event
+            .query_json("SELECT batch_id FROM query_batch_receipts")
+            .await?,
+        json!([{ "batch_id": "batch-1" }])
+    );
+    assert_eq!(
+        event
+            .query_json("SELECT last_sequence FROM query_source_watermarks")
+            .await?,
+        json!([{ "last_sequence": 3 }])
+    );
+    event.rollback().await?;
+    Ok(())
+}
+
 /// KV, alarm, and attachment writes are visible before commit and disappear on rollback.
 #[tokio::test]
 async fn worker_state_reads_own_writes_and_rolls_back() -> Result<(), verglas_do_turso::Error> {

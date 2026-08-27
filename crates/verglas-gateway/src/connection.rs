@@ -111,7 +111,7 @@ impl DoConnection {
         Ok((ws, receiver))
     }
 
-    /// Sends one client WebSocket message and waits only for frame admission.
+    /// Sends one client WebSocket message and waits for its terminal frame.
     pub(crate) async fn websocket_message(
         &self,
         ws: u64,
@@ -131,7 +131,7 @@ impl DoConnection {
         response.await.map_err(|_| GatewayError::Disconnected)?
     }
 
-    /// Sends a client WebSocket close event and waits until its frame is written.
+    /// Sends a client WebSocket close event and waits for its terminal frame.
     pub(crate) async fn websocket_close(
         &self,
         ws: u64,
@@ -183,10 +183,10 @@ enum Command {
         text: bool,
         /// Raw message bytes.
         data: Vec<u8>,
-        /// Admission acknowledgement channel, independent of the event terminal frame.
+        /// Transaction-terminal acknowledgement channel.
         respond_to: oneshot::Sender<Result<(), GatewayError>>,
     },
-    /// Writes one ws-close event without requiring a client response.
+    /// Writes one ws-close event and waits for its transaction terminal frame.
     WebSocketClose {
         /// Gateway-owned WebSocket identity.
         ws: u64,
@@ -194,7 +194,7 @@ enum Command {
         code: u16,
         /// Client close reason.
         reason: String,
-        /// Channel acknowledged after the frame is written.
+        /// Transaction-terminal acknowledgement channel.
         respond_to: oneshot::Sender<Result<(), GatewayError>>,
     },
     /// Removes one disconnected WebSocket identity.
@@ -208,8 +208,8 @@ enum Command {
 enum PendingEvent {
     /// HTTP fetch response waiter.
     Fetch(oneshot::Sender<Result<FetchResponse, GatewayError>>),
-    /// WebSocket event whose client does not wait for the terminal frame.
-    Ignore,
+    /// WebSocket event waiter resolved only after its transaction commits.
+    WebSocket(oneshot::Sender<Result<(), GatewayError>>),
 }
 
 /// Owns one split Unix event socket and all pending event identities.
@@ -338,13 +338,13 @@ impl EventActor {
                     text,
                     data_b64: base64::engine::general_purpose::STANDARD.encode(data),
                 };
-                self.pending.insert(id, PendingEvent::Ignore);
+                self.pending.insert(id, PendingEvent::WebSocket(respond_to));
                 if let Err(error) = self.write_frame(&frame).await {
-                    self.pending.remove(&id);
-                    let _ = respond_to.send(Err(error.clone()));
+                    if let Some(PendingEvent::WebSocket(respond_to)) = self.pending.remove(&id) {
+                        let _ = respond_to.send(Err(error.clone()));
+                    }
                     return Err(error);
                 }
-                let _ = respond_to.send(Ok(()));
             }
             Command::WebSocketClose {
                 ws,
@@ -365,13 +365,13 @@ impl EventActor {
                     code,
                     reason,
                 };
-                self.pending.insert(id, PendingEvent::Ignore);
+                self.pending.insert(id, PendingEvent::WebSocket(respond_to));
                 if let Err(error) = self.write_frame(&frame).await {
-                    self.pending.remove(&id);
-                    let _ = respond_to.send(Err(error.clone()));
+                    if let Some(PendingEvent::WebSocket(respond_to)) = self.pending.remove(&id) {
+                        let _ = respond_to.send(Err(error.clone()));
+                    }
                     return Err(error);
                 }
-                let _ = respond_to.send(Ok(()));
             }
             Command::RemoveWebSocket { ws } => {
                 self.websockets.remove(&ws);
@@ -486,10 +486,15 @@ impl EventActor {
                         message: format!("done references unknown event {id}"),
                     });
                 };
-                if !matches!(pending, PendingEvent::Ignore) {
-                    return Err(GatewayError::Protocol {
-                        message: format!("done references a non-WebSocket event {id}"),
-                    });
+                match pending {
+                    PendingEvent::WebSocket(respond_to) => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    PendingEvent::Fetch(_) => {
+                        return Err(GatewayError::Protocol {
+                            message: format!("done references a non-WebSocket event {id}"),
+                        });
+                    }
                 }
             }
             WorkerFrame::Error { id, message } => {
@@ -503,7 +508,9 @@ impl EventActor {
                     PendingEvent::Fetch(respond_to) => {
                         let _ = respond_to.send(Err(error));
                     }
-                    PendingEvent::Ignore => {}
+                    PendingEvent::WebSocket(respond_to) => {
+                        let _ = respond_to.send(Err(error));
+                    }
                 }
             }
         }
@@ -568,7 +575,9 @@ impl EventActor {
                 PendingEvent::Fetch(respond_to) => {
                     let _ = respond_to.send(Err(error.clone()));
                 }
-                PendingEvent::Ignore => {}
+                PendingEvent::WebSocket(respond_to) => {
+                    let _ = respond_to.send(Err(error.clone()));
+                }
             }
         }
         self.websockets.clear();

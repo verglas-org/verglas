@@ -51,3 +51,5 @@
 - #171: Updated the dependency-direction guard for the supervisor's final
   `verglasd` package name. Runtime remains independent and is launched only
   through the process contract.
+- #175: Live Durable Object children now require exact per-object S3-CAS configuration and open Turso through it. Turso and Catalog Iceberg storage share one Foyer instance, while an explicit build-only mode serializes components without opening storage or binding an event socket.
+- #0: Move public architecture assertions with the documentation to verglas-sdk. The runtime repository no longer reaches into a removed Mintlify tree during tests.

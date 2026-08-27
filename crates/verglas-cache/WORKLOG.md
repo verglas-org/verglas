@@ -544,3 +544,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   NVMe hits, ETag isolation, invalidation/refill, concurrent fill coalescing,
   and hard DRAM/NVMe budget rejection.
 - #171: Removed the final block-geometry comment promising future peer transfer. The retained Foyer cache geometry now describes only local admission, eviction, and origin fills.
+- #175: Added a small local-state record inside the existing Foyer engine for disposable Turso recovery cursors. SQL pages and Iceberg objects continue to share one cache authority; no second local database or cache directory was introduced.

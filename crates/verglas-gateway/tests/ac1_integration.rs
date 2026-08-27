@@ -237,16 +237,14 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
 fn build_component(project: &Path, components: &Path) {
     // The builder invokes componentize with --world-name service. Keep this
     // fixture on the frozen WIT v2 world rather than restoring durable-object.
-    let script = repository_root().join("sdks/worker-js/bin/build.mjs");
-    let output = Command::new("node")
-        .arg(script)
+    let output = Command::new("verglas-worker-build")
         .arg(project)
         .arg("--out")
         .arg(components)
         .arg("--gateway")
         .arg(project.join("gateway.json"))
         .output()
-        .unwrap_or_else(|error| panic!("node is required to build AC1 component: {error}"));
+        .unwrap_or_else(|error| panic!("verglas-worker-build is required for AC1: {error}"));
     assert!(
         output.status.success(),
         "worker-js builder failed: {}{}",

@@ -1,9 +1,9 @@
 //! One serialized embedded Turso database per Durable Object.
 //!
-//! The local database is the production durability boundary. Event transactions
-//! use explicit `BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK` on one connection so
-//! their lifetime can cross WIT calls safely. A successful event commit includes
-//! an explicit Turso WAL checkpoint before effects are released.
+//! Production virtual files commit through S3 CAS; Foyer is only their disposable
+//! block and recovery-cursor cache. Event transactions use explicit `BEGIN
+//! IMMEDIATE`, `COMMIT`, and `ROLLBACK` on one connection so their lifetime can
+//! cross WIT calls safely.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use turso::{Connection, Value};
 
+use crate::cas_io::{CasIo, RecoveryStats, TursoCasStorage};
 use crate::error::{Error, Result};
 use crate::outbox::{OutboxKey, OutboxRecord, StreamAppenderHandle};
 use crate::rows::rows_to_json;
@@ -30,6 +31,10 @@ pub struct TursoStore {
     source_do_id: Arc<str>,
     /// Local database path whose complete sidecar family stays under the DO root.
     local_path: Arc<PathBuf>,
+    /// S3-CAS IO when this store has no authoritative local Turso file.
+    cas_io: Option<Arc<CasIo>>,
+    /// Work performed while reconciling the reusable Foyer cursor.
+    recovery: RecoveryStats,
     /// Embedded database kept alive for the lifetime of its shared connection.
     _database: turso::Database,
     /// One connection shared by all event WIT calls.
@@ -45,9 +50,8 @@ pub struct TursoStore {
 impl TursoStore {
     /// Opens the embedded Turso database and validates its reserved schema.
     ///
-    /// The local database is production state, not a test fallback. Opening
-    /// performs a serialized local readiness fence, reserved-table bootstrap,
-    /// schema validation, and a WAL checkpoint before returning.
+    /// This filesystem constructor is retained for isolated crate tests. Hosted
+    /// Durable Objects use [`Self::open_cas`] and never treat this path as state.
     pub async fn open<P, N>(local_path: P, client_name: N) -> Result<Self>
     where
         P: AsRef<Path>,
@@ -65,6 +69,24 @@ impl TursoStore {
         Ok(store)
     }
 
+    /// Opens Turso over immutable S3 deltas and one conditional head pointer.
+    pub async fn open_cas<N>(storage: TursoCasStorage, client_name: N) -> Result<Self>
+    where
+        N: Into<String>,
+    {
+        let (io, recovery) = storage.open_io().await?;
+        let database = turso::Builder::new_local("turso.db")
+            .with_io_impl(io.clone())
+            .build()
+            .await?;
+        let mut store = Self::new(client_name, PathBuf::from("turso.db"), database).await?;
+        store.cas_io = Some(io);
+        store.recovery = recovery;
+        store.ensure_reserved_schema().await?;
+        store.validate_schema().await?;
+        Ok(store)
+    }
+
     /// Creates the shared connection and synchronization gates for one database.
     async fn new<N>(client_name: N, path: PathBuf, database: turso::Database) -> Result<Self>
     where
@@ -74,12 +96,19 @@ impl TursoStore {
         Ok(Self {
             source_do_id: Arc::from(client_name.into()),
             local_path: Arc::new(path),
+            cas_io: None,
+            recovery: RecoveryStats::default(),
             _database: database,
             connection: Arc::new(Mutex::new(connection)),
             event_lock: Arc::new(Mutex::new(())),
             appender: Arc::new(RwLock::new(None)),
             appender_external: Arc::new(RwLock::new(false)),
         })
+    }
+
+    /// Reports the CAS-head reconciliation performed by this activation.
+    pub fn recovery_stats(&self) -> RecoveryStats {
+        self.recovery
     }
 
     /// Returns the DO identity used in outbox record identities.
@@ -203,6 +232,7 @@ impl TursoStore {
             source_do_id: Arc::clone(&self.source_do_id),
             event_sequence: sequence,
             connection: Arc::clone(&self.connection),
+            cas_io: self.cas_io.clone(),
             event_guard,
             next_record_index: AtomicU32::new(0),
             finished: false,
@@ -431,6 +461,8 @@ pub struct TursoEvent {
     event_sequence: u64,
     /// Shared Turso connection used by every event operation.
     connection: Arc<Mutex<Connection>>,
+    /// CAS conflict channel populated by the virtual filesystem.
+    cas_io: Option<Arc<CasIo>>,
     /// Exclusive event gate held until commit or rollback completes.
     event_guard: OwnedMutexGuard<()>,
     /// Next record index allocated by this event's Stream sends.
@@ -676,10 +708,19 @@ impl TursoEvent {
         let connection = self.connection.lock().await;
         if let Err(error) = connection.execute("COMMIT", ()).await {
             rollback_quiet(&connection).await;
+            if let Some(conflict) = self.cas_io.as_ref().and_then(|io| io.take_conflict()) {
+                return Err(Error::Conflict(conflict));
+            }
             return Err(error.into());
         }
         self.finished = true;
-        checkpoint_connection(&connection).await
+        if let Err(error) = checkpoint_connection(&connection).await {
+            if let Some(conflict) = self.cas_io.as_ref().and_then(|io| io.take_conflict()) {
+                return Err(Error::Conflict(conflict));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Rolls back every state and outbox mutation in this event.

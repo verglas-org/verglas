@@ -277,29 +277,11 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
-  custom-publish-sdk:
-    needs:
-      - plan
-      - host
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
-    uses: ./.github/workflows/publish-sdk.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    # publish jobs get escalated permissions
-    permissions:
-      "id-token": "write"
-      "packages": "write"
-
   announce:
     needs:
       - plan
       - host
-      - custom-publish-sdk
-    # use "always() && ..." to allow the SDK publish job to skip itself for
-    # prereleases while still waiting for it when it runs. "host" must run to
-    # completion; it is never optional.
-    if: ${{ always() && needs.host.result == 'success' && (needs.custom-publish-sdk.result == 'skipped' || needs.custom-publish-sdk.result == 'success') }}
+    if: ${{ needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

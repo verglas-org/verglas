@@ -3,7 +3,6 @@ resolver = "2"
 # One workspace for the runtime, product hosts, and retained Catalog support
 # crates. The pinned Iceberg fork supplies the commit constructor used by the
 # narrow runtime capability.
-exclude = ["sdks/typescript"]
 members = [
     "crates/verglas-backend",
     "crates/verglas-core",
@@ -66,6 +65,7 @@ foyer = "0.22.3"
 # version foyer 0.22.3 depends on so the trait objects are compatible.
 mixtrics = "0.2.5"
 futures = "0.3.31"
+flate2 = "1.1.9"
 libc = "0.2.180"
 object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
 s3s = "0.14.1"
@@ -97,6 +97,7 @@ wasmtime = { version = "48.0.0", default-features = false, features = [
     "async",
     "runtime",
     "cranelift",
+    "parallel-compilation",
 ] }
 wasmtime-wasi = { version = "48.0.0", default-features = false, features = ["p2"] }
 wat = "1.238.0"

@@ -1,7 +1,7 @@
 //! Strict Wrangler and pipeline manifest acceptance tests.
 
 use tempfile::tempdir;
-use verglas_gateway::{Manifest, ManifestError};
+use verglas_gateway::{ArtifactProduct, Manifest, ManifestError};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -41,6 +41,120 @@ fn accepts_jsonc_and_pipeline_bindings() {
 }
 
 #[test]
+fn accepts_vectorize_bindings_and_selects_the_vectorize_artifact() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
+    let object = value.as_object_mut().expect("manifest object");
+    object.insert(
+        "vectorize".to_owned(),
+        serde_json::json!([{"binding":"VECTORIZE","index_name":"documents"}]),
+    );
+    object
+        .get_mut("artifacts")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("artifacts")
+        .insert(
+            "vectorize".to_owned(),
+            serde_json::json!({"digest":DIGEST,"component_dir":"./vectorize"}),
+        );
+    let manifest = Manifest::parse(&value.to_string()).expect("Vectorize manifest");
+    let binding = manifest.vectorize("VECTORIZE").expect("Vectorize binding");
+    assert_eq!(binding.index_name(), "documents");
+    assert_eq!(
+        manifest
+            .artifact_for_binding("VECTORIZE", "documents")
+            .expect("Vectorize artifact")
+            .digest(),
+        DIGEST
+    );
+}
+
+#[test]
+fn accepts_graph_bindings_and_selects_the_graph_artifact() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
+    let object = value.as_object_mut().expect("manifest object");
+    object.insert(
+        "graphs".to_owned(),
+        serde_json::json!([{"binding":"GRAPH","graph_name":"knowledge"}]),
+    );
+    object
+        .get_mut("artifacts")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("artifacts")
+        .insert(
+            "graph".to_owned(),
+            serde_json::json!({"digest":DIGEST,"component_dir":"./graph"}),
+        );
+    let manifest = Manifest::parse(&value.to_string()).expect("Graph manifest");
+    let binding = manifest.graph("GRAPH").expect("Graph binding");
+    assert_eq!(binding.graph_name(), "knowledge");
+    assert_eq!(
+        manifest
+            .product_for_binding("GRAPH", "knowledge")
+            .expect("Graph product"),
+        ArtifactProduct::Graph
+    );
+    assert_eq!(
+        manifest
+            .artifact_for_binding("GRAPH", "knowledge")
+            .expect("Graph artifact")
+            .digest(),
+        DIGEST
+    );
+}
+
+#[test]
+fn accepts_query_bindings_and_selects_the_query_artifact() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
+    let object = value.as_object_mut().expect("manifest object");
+    object.insert(
+        "queries".to_owned(),
+        serde_json::json!([{"binding":"ANALYTICS","query_name":"sales"}]),
+    );
+    object
+        .get_mut("artifacts")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("artifacts")
+        .insert(
+            "query".to_owned(),
+            serde_json::json!({"digest":DIGEST,"component_dir":"./query"}),
+        );
+    let manifest = Manifest::parse(&value.to_string()).expect("Query manifest");
+    let binding = manifest.query("ANALYTICS").expect("Query binding");
+    assert_eq!(binding.query_name(), "sales");
+    assert_eq!(
+        manifest
+            .product_for_binding("ANALYTICS", "sales")
+            .expect("Query product"),
+        ArtifactProduct::Query
+    );
+    assert_eq!(
+        manifest
+            .artifact_for_binding("ANALYTICS", "sales")
+            .expect("Query artifact")
+            .digest(),
+        DIGEST
+    );
+}
+
+#[test]
+fn rejects_unsupported_skill_bindings() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
+    let object = value.as_object_mut().expect("manifest object");
+    object.insert(
+        "skills".to_owned(),
+        serde_json::json!([{"binding":"FANTASY_DRAFT","skill_name":"fantasy-draft"}]),
+    );
+    assert!(matches!(
+        Manifest::parse(&value.to_string()),
+        Err(ManifestError::UnknownTopLevelKey { key }) if key == "skills"
+    ));
+}
+
+#[test]
 fn compatibility_migrations_and_vars_are_preserved() {
     let source = source(
         ",\n            \"compatibility_date\":\"2024-01-01\",\n            \"compatibility_flags\":[\"nodejs_compat\"],\n            \"migrations\":[{\"tag\":\"v1\",\"new_classes\":[\"Counter\"]}],\n            \"vars\":{\"LIMIT\":3}",
@@ -50,6 +164,31 @@ fn compatibility_migrations_and_vars_are_preserved() {
     assert_eq!(manifest.compatibility_flags(), &["nodejs_compat"]);
     assert_eq!(manifest.migrations()[0].new_classes(), &["Counter"]);
     assert_eq!(manifest.vars()["LIMIT"], serde_json::json!(3));
+}
+
+#[test]
+fn scheduled_cron_triggers_are_preserved() {
+    let manifest = Manifest::parse(&source(
+        ",\n            \"triggers\":{\"crons\":[\"*/5 * * * *\",\"0 0 * * *\"]}",
+    ))
+    .expect("scheduled manifest");
+    assert_eq!(manifest.crons(), &["*/5 * * * *", "0 0 * * *"]);
+}
+
+#[test]
+fn malformed_scheduled_cron_triggers_are_rejected() {
+    let unknown = source(",\n            \"triggers\":{\"surprise\":[]}");
+    assert!(matches!(
+        Manifest::parse(&unknown),
+        Err(ManifestError::UnknownTriggersKey { key }) if key == "surprise"
+    ));
+
+    let invalid = source(",\n            \"triggers\":{\"crons\":[42]}");
+    assert!(matches!(
+        Manifest::parse(&invalid),
+        Err(ManifestError::InvalidType { field, expected })
+            if field == "triggers.crons" && expected == "string"
+    ));
 }
 
 #[test]

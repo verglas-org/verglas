@@ -8,11 +8,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use verglas_core::config::Backend;
-use verglas_s3::{
-    BackendStore, BackendStores, NoopInvalidation, PassthroughList, PassthroughRead,
-    PassthroughWrite,
-};
+use verglas_cache::HybridCacheEngine;
+use verglas_core::config::{Backend, Cache};
+use verglas_s3::{BackendStore, BackendStores, PassthroughList, PassthroughRead, PassthroughWrite};
 
 /// Strict coordinates for one object-owned S3 endpoint.
 struct Config {
@@ -24,6 +22,7 @@ struct Config {
     region: String,
     origin_credentials: PathBuf,
     client_credentials: PathBuf,
+    cache_config: PathBuf,
 }
 
 impl Config {
@@ -38,6 +37,7 @@ impl Config {
         let mut region = None;
         let mut origin_credentials = None;
         let mut client_credentials = None;
+        let mut cache_config = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--listen" => {
@@ -70,6 +70,10 @@ impl Config {
                         "--client-credentials",
                     )?));
                 }
+                "--cache-config" => {
+                    cache_config =
+                        Some(PathBuf::from(next_value(&mut arguments, "--cache-config")?));
+                }
                 "--help" => return Err(usage().to_owned()),
                 other => return Err(format!("unknown argument {other}\n{}", usage())),
             }
@@ -85,6 +89,8 @@ impl Config {
                 .ok_or_else(|| format!("missing --origin-credentials\n{}", usage()))?,
             client_credentials: client_credentials
                 .ok_or_else(|| format!("missing --client-credentials\n{}", usage()))?,
+            cache_config: cache_config
+                .ok_or_else(|| format!("missing --cache-config\n{}", usage()))?,
         })
     }
 }
@@ -108,7 +114,7 @@ fn required(value: Option<String>, option: &str) -> Result<String, String> {
 
 /// Returns the one supported invocation shape.
 fn usage() -> &'static str {
-    "usage: verglas-s3-proxy --listen ADDR --storage-binding-id ID --public-bucket NAME --origin-bucket NAME --endpoint URL --region REGION --origin-credentials PATH --client-credentials PATH"
+    "usage: verglas-s3-proxy --listen ADDR --storage-binding-id ID --public-bucket NAME --origin-bucket NAME --endpoint URL --region REGION --origin-credentials PATH --client-credentials PATH --cache-config PATH"
 }
 
 /// Reads one AWS-format credentials file without exposing either key in argv.
@@ -116,6 +122,22 @@ fn credentials(path: &PathBuf) -> Result<(String, String), Box<dyn Error>> {
     let contents = fs::read_to_string(path)?;
     verglas_backend::read_aws_keypair(&contents, "default")
         .ok_or_else(|| format!("credentials file {} has no default keypair", path.display()).into())
+}
+
+/// Loads the shared host cache stanza but gives this process its own Foyer
+/// device directory. The runtime and S3 endpoint must never open one device
+/// concurrently.
+fn cache_config(path: &PathBuf) -> Result<Cache, Box<dyn Error>> {
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut cache: Cache = serde_json::from_value(
+        document
+            .get("cache")
+            .cloned()
+            .ok_or("cache config has no cache stanza")?,
+    )?;
+    cache.validate()?;
+    cache.dir = cache.dir.join("s3-proxy");
+    Ok(cache)
 }
 
 /// Runs the exact-bucket proxy until it receives a termination signal.
@@ -129,6 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let client_credentials = credentials(&config.client_credentials)?;
+    let cache = cache_config(&config.cache_config)?;
     let backend = Backend {
         bucket: Some(config.origin_bucket.clone()),
         endpoint: Some(config.endpoint.clone()),
@@ -145,12 +168,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.public_bucket,
         config.origin_bucket,
     ));
+    let foyer = HybridCacheEngine::new(PassthroughRead::new(Arc::clone(&stores)), &cache).await?;
     let app = verglas_s3::router_with_passthrough(
         config.storage_binding_id,
-        PassthroughRead::new(Arc::clone(&stores)),
+        foyer.clone(),
         PassthroughWrite::new(Arc::clone(&stores)),
         Arc::new(PassthroughList::new(Arc::clone(&stores))),
-        Arc::new(NoopInvalidation),
+        Arc::new(foyer),
         Some(client_credentials),
         Some(stores),
         None,

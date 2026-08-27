@@ -12,8 +12,11 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use verglas_backend::{BackendStore, BackendStores, BucketAliasStores, StartupProbeError};
+use verglas_cache::HybridCacheEngine;
 use verglas_core::config::{Backend, Cache};
+use verglas_do_turso::TursoCasStorage;
 use verglas_iceberg::SinkCompression;
+use verglas_s3::PassthroughRead;
 
 use crate::{
     CatalogCommitServiceConfig, IcebergCatalogCommitService, OriginStorageConfig,
@@ -135,6 +138,14 @@ pub struct CatalogHostConfig {
     pub sink: SinkFence,
 }
 
+/// Host capabilities sharing one per-object origin and one Foyer cache.
+pub struct DurableHostState {
+    /// Turso's S3-CAS virtual filesystem for this object.
+    pub turso: TursoCasStorage,
+    /// Catalog's optional Iceberg commit capability over the same cache.
+    pub catalog: Arc<IcebergCatalogCommitService>,
+}
+
 impl CatalogHostConfig {
     /// Reads and validates one strict JSON operator configuration file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, CatalogHostConfigError> {
@@ -203,6 +214,14 @@ impl CatalogHostConfig {
     pub async fn build_catalog_commit_service(
         &self,
     ) -> Result<Arc<IcebergCatalogCommitService>, CatalogHostConfigError> {
+        Ok(self.build_durable_host_state().await?.catalog)
+    }
+
+    /// Builds Turso and Iceberg storage over one Foyer instance. The configured
+    /// physical bucket must belong to exactly one Durable Object.
+    pub async fn build_durable_host_state(
+        &self,
+    ) -> Result<DurableHostState, CatalogHostConfigError> {
         self.validate()?;
         let store =
             BackendStore::from_config(self.origin.storage_binding_id.clone(), &self.origin.backend);
@@ -217,13 +236,24 @@ impl CatalogHostConfig {
             self.origin.bucket.clone(),
             physical_bucket,
         ));
+        let cache = HybridCacheEngine::new(PassthroughRead::new(Arc::clone(&stores)), &self.cache)
+            .await
+            .map_err(|error| OriginStorageError::Cache(error.to_string()))?;
+        let turso = TursoCasStorage::new(
+            Arc::clone(&stores),
+            cache.clone(),
+            self.origin.storage_binding_id.clone(),
+            self.origin.bucket.clone(),
+            "turso",
+        )
+        .map_err(|error| CatalogHostConfigError::Invalid(error.to_string()))?;
         let origin_config = OriginStorageConfig::new(
             self.origin.storage_binding_id.clone(),
             self.origin.bucket.clone(),
             self.cache.clone(),
         )
         .with_scheme(self.origin.scheme.clone());
-        let factory = OriginStorageFactory::new(stores, origin_config).await?;
+        let factory = OriginStorageFactory::with_cache(stores, origin_config, cache)?;
         let service_config = CatalogCommitServiceConfig::new(
             self.sink.sink_id.clone(),
             self.origin.bucket.clone(),
@@ -232,10 +262,11 @@ impl CatalogHostConfig {
             self.sink.compression,
         )
         .with_warehouse(self.warehouse.clone());
-        Ok(Arc::new(IcebergCatalogCommitService::new(
+        let catalog = Arc::new(IcebergCatalogCommitService::new(
             Arc::new(factory),
             service_config,
-        )))
+        ));
+        Ok(DurableHostState { turso, catalog })
     }
 }
 
@@ -298,27 +329,8 @@ fn validate_scheme(scheme: &str) -> Result<(), CatalogHostConfigError> {
 
 /// Validates the hard DRAM and persistent budgets required by Foyer.
 fn validate_cache_budgets(cache: &Cache) -> Result<(), CatalogHostConfigError> {
-    const DISK_FRAMING_BYTES: u64 = 16 * 1024;
-    const MIN_DISK_BLOCKS: u64 = 4;
-    const MAPPING_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-    const MIN_BLOCK_MEMORY_BYTES: u64 = 2 * 4096;
-
-    let dram = cache.dram_bytes.0;
-    let mapping = (dram / 16).clamp(4096, MAPPING_BUDGET_BYTES);
-    if dram.saturating_sub(mapping) < MIN_BLOCK_MEMORY_BYTES {
-        return Err(CatalogHostConfigError::Invalid(format!(
-            "cache DRAM budget is too small: {dram} bytes"
-        )));
-    }
-    let block = cache.data_block_bytes.0;
-    let minimum_disk = MIN_DISK_BLOCKS.saturating_mul(block.saturating_add(DISK_FRAMING_BYTES));
-    if cache.capacity_bytes.0 < minimum_disk {
-        return Err(CatalogHostConfigError::Invalid(format!(
-            "cache persistent budget is too small: {} bytes",
-            cache.capacity_bytes.0
-        )));
-    }
-    Ok(())
+    verglas_cache::validate_cache_budgets(cache)
+        .map_err(|error| CatalogHostConfigError::Invalid(error.to_string()))
 }
 
 /// Requires the warehouse to stay below the exact configured URI authority.

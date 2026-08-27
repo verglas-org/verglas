@@ -98,6 +98,9 @@ interface worker {
 
   /// Handles one stateless Worker-tier HTTP request.
   fetch: func(request: request) -> result<response, handler-error>;
+
+  /// Handles one stateless Worker cron event at its logical UTC deadline.
+  scheduled: func(scheduled-epoch-millis: u64, cron: string) -> result<_, handler-error>;
 }
 
 interface bindings {

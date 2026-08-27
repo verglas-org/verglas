@@ -31,6 +31,10 @@ struct Config {
     event_socket: Option<PathBuf>,
     /// Optional strict operator configuration for the Catalog host capability.
     catalog_host_config: Option<PathBuf>,
+    /// Required per-object S3-CAS and Foyer configuration for a live DO.
+    storage_host_config: Option<PathBuf>,
+    /// Build-time component serialization without a database or event server.
+    precompile_only: bool,
 }
 
 impl Config {
@@ -44,6 +48,8 @@ impl Config {
         let mut cwasm_cache_dir = None;
         let mut event_socket = None;
         let mut catalog_host_config = None;
+        let mut storage_host_config = None;
+        let mut precompile_only = false;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--do-id" => do_id = Some(next_value(&mut arguments, "--do-id")?),
@@ -77,6 +83,13 @@ impl Config {
                         "--catalog-host-config",
                     )?));
                 }
+                "--storage-host-config" => {
+                    storage_host_config = Some(PathBuf::from(next_value(
+                        &mut arguments,
+                        "--storage-host-config",
+                    )?));
+                }
+                "--precompile-only" => precompile_only = true,
                 unknown => return Err(format!("unknown argument `{unknown}`")),
             }
         }
@@ -90,8 +103,24 @@ impl Config {
         if cwasm_cache_dir.is_some() && component_digest.is_none() {
             return Err("--cwasm-cache-dir requires a verified component".to_owned());
         }
+        // Catalog's privileged configuration is also the object's storage
+        // configuration; accepting the one path keeps the exact capability
+        // declaration while ensuring Catalog uses the same CAS/Foyer state.
+        if storage_host_config.is_none() {
+            storage_host_config.clone_from(&catalog_host_config);
+        }
         if event_socket.is_some() && component_digest.is_none() {
             return Err("--event-socket requires a verified component".to_owned());
+        }
+        if event_socket.is_some() && storage_host_config.is_none() {
+            return Err(
+                "--event-socket requires --storage-host-config for per-object S3-CAS".to_owned(),
+            );
+        }
+        if precompile_only
+            && (component_digest.is_none() || cwasm_cache_dir.is_none() || event_socket.is_some())
+        {
+            return Err("--precompile-only requires a verified component and --cwasm-cache-dir, and forbids --event-socket".to_owned());
         }
         if catalog_host_config.is_some() && event_socket.is_none() {
             return Err(
@@ -106,6 +135,8 @@ impl Config {
             cwasm_cache_dir,
             event_socket,
             catalog_host_config,
+            storage_host_config,
+            precompile_only,
         })
     }
 }
@@ -114,17 +145,37 @@ impl Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::parse().map_err(|error| format!("{error}\n{}", usage()))?;
-    let catalog_commit = match config.catalog_host_config.as_ref() {
+    if config.precompile_only {
+        load_runtime(&config)
+            .await?
+            .ok_or("--precompile-only requires a verified component")?;
+        return Ok(());
+    }
+    let host_state = match config.storage_host_config.as_ref() {
         Some(path) => Some(
             CatalogHostConfig::load(path)?
-                .build_catalog_commit_service()
+                .build_durable_host_state()
                 .await?,
         ),
         None => None,
     };
+    let catalog_commit = if config.catalog_host_config.is_some() {
+        Some(Arc::clone(
+            &host_state
+                .as_ref()
+                .ok_or("Catalog requires storage host state")?
+                .catalog,
+        ))
+    } else {
+        None
+    };
     let runtime = load_runtime(&config).await?.map(Arc::new);
-    let store =
-        Arc::new(TursoStore::open(config.data_dir.join("turso.db"), config.do_id.clone()).await?);
+    let store = match host_state {
+        Some(state) => Arc::new(TursoStore::open_cas(state.turso, config.do_id.clone()).await?),
+        None => Arc::new(
+            TursoStore::open(config.data_dir.join("turso.db"), config.do_id.clone()).await?,
+        ),
+    };
     match config.event_socket {
         Some(event_socket) => {
             let runtime = runtime.ok_or("--event-socket requires a verified component")?;
@@ -195,5 +246,5 @@ fn required_text(value: Option<String>, option: &str) -> Result<String, String> 
 
 /// Describes the accepted runtime argument surface.
 fn usage() -> &'static str {
-    "usage: verglas-runtime --do-id ID --data-dir PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH] [--catalog-host-config PATH]"
+    "usage: verglas-runtime --do-id ID --data-dir PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] (--precompile-only | --event-socket PATH --storage-host-config PATH)] [--catalog-host-config PATH]"
 }

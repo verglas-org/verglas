@@ -168,6 +168,21 @@ impl OriginStorageFactory {
         let cache = HybridCacheEngine::new(origin, &config.cache)
             .await
             .map_err(|error| OriginStorageError::Cache(error.to_string()))?;
+        Self::with_cache(stores, config, cache)
+    }
+
+    /// Opens a factory over an already constructed host cache. Turso and
+    /// Iceberg use this path so one Foyer instance is the cell's only local
+    /// cache authority.
+    pub fn with_cache(
+        stores: Arc<dyn BackendStores>,
+        config: OriginStorageConfig,
+        cache: HybridCacheEngine,
+    ) -> std::result::Result<Self, OriginStorageError> {
+        validate_config(&config)?;
+        stores
+            .store_for(&config.storage_binding_id, &config.bucket)
+            .map_err(|error| OriginStorageError::Backend(error.to_string()))?;
         Ok(Self {
             stores,
             config,

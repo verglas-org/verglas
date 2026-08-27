@@ -107,6 +107,12 @@ pub enum GatewayError {
     /// Direct Fly ingress did not carry the control-plane mesh credential.
     #[error("unauthorized Worker ingress")]
     UnauthorizedIngress,
+    /// A scheduled event did not carry the control-plane scheduler credential.
+    #[error("unauthorized Worker scheduled event")]
+    UnauthorizedScheduled,
+    /// A hibernating socket event did not carry the edge session credential.
+    #[error("unauthorized Worker WebSocket event")]
+    UnauthorizedWebSocket,
 }
 
 impl GatewayError {
@@ -144,6 +150,8 @@ impl GatewayError {
             Self::WorkerPool { .. } => "worker-pool",
             Self::RemoteWorker { .. } => "remote-worker",
             Self::UnauthorizedIngress => "unauthorized-ingress",
+            Self::UnauthorizedScheduled => "unauthorized-scheduled",
+            Self::UnauthorizedWebSocket => "unauthorized-websocket",
         }
     }
 }
@@ -154,7 +162,9 @@ impl IntoResponse for GatewayError {
         let status = match &self {
             Self::UnknownBinding { .. } | Self::UnknownObject { .. } => StatusCode::NOT_FOUND,
             Self::InvalidHttp { .. } => StatusCode::BAD_REQUEST,
-            Self::UnauthorizedIngress => StatusCode::UNAUTHORIZED,
+            Self::UnauthorizedIngress
+            | Self::UnauthorizedScheduled
+            | Self::UnauthorizedWebSocket => StatusCode::UNAUTHORIZED,
             Self::WorkerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ControlIo { .. }
             | Self::SpawnRejected { .. }

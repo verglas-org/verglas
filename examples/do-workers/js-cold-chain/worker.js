@@ -41,6 +41,15 @@ export class Counter extends DurableObject {
 }
 
 export default {
+  async scheduled(_controller, env) {
+    const id = env.COUNTER.idFromName(COUNTER_NAME);
+    const response = await env.COUNTER.get(id).fetch(new Request(
+      'https://verglas.internal/incr',
+      { method: 'POST' },
+    ));
+    if (!response.ok) throw new Error(`scheduled increment failed: ${response.status}`);
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/incr' || url.pathname === '/') {
@@ -49,7 +58,7 @@ export default {
     }
     if (url.pathname === '/process' && request.method === 'POST') {
       return env.PIPELINE.fetch(new Request(
-        'https://verglas.internal/pipeline/process-now',
+        'https://verglas.internal/pipeline/enqueue',
         { method: 'POST' },
       ));
     }

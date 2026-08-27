@@ -20,3 +20,11 @@
 - #171: Removed the obsolete broader-runtime comparison from the Pipeline README. The
   documented SQL boundary now describes the implemented evaluator directly and
   keeps the product contract independent of retired query-engine terminology.
+- #176: Pipelines now register as Stream retention consumers and acknowledge only after every Sink confirms and the local cursor commits. Retry first catches the acknowledgment up to the durable cursor, so a lost remote acknowledgment delays cleanup without risking data loss. Pipeline also validates the contiguous union of Stream records and validation skips, advancing and acknowledging all-skipped ranges without creating empty Sink batches.
+- #0: Corrected the immutable-SQL restart test to assert the initialization failure directly. Pipeline configuration mismatches are proven to fail before the object serves a request.
+- #0: Added durable asynchronous Pipeline enqueue. Submission now acknowledges after the Pipeline alarm is committed, while Stream reads, Sink delivery, retries, and cursor advancement run in independent alarm events.
+- #0: Delayed newly inserted Pipeline alarms by 100 ms so Verglas cannot
+  reacquire the object for downstream work before the durable `202 queued`
+  response has flushed; the regression test first witnessed the alarm being
+  immediately due.
+- #0: Consume the published JavaScript Worker SDK for component and runtime-surface tests. Pipeline no longer reaches into an SDK source tree owned by another repository.

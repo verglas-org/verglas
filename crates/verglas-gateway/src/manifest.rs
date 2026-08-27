@@ -1,8 +1,8 @@
 //! Strict parsing for the Wrangler manifest and product deployment contract.
 //!
-//! Durable-object namespaces, Stream bindings, system product services, and the
-//! exact runtime host capability are separate maps. Each selected product resolves
-//! to one immutable artifact; unknown fields fail before process launch.
+//! Durable-object namespaces, Stream, Vectorize, Graph, and Query bindings, system product
+//! services, and the exact runtime host capability are separate maps. Each selected product resolves to
+//! one immutable artifact; unknown fields fail before process launch.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,79 @@ pub struct PipelineBinding {
     origin: Option<String>,
 }
 
+/// One Wrangler `vectorize` binding targeting a prebuilt Vectorize index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VectorizeBinding {
+    binding: String,
+    index_name: String,
+    origin: Option<String>,
+}
+
+/// One Verglas `graphs` binding targeting a prebuilt named property graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphBinding {
+    binding: String,
+    graph_name: String,
+    origin: Option<String>,
+}
+
+/// One Verglas `queries` binding targeting a named Query materialization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryBinding {
+    binding: String,
+    query_name: String,
+    origin: Option<String>,
+}
+
+impl QueryBinding {
+    /// Returns the environment binding exposed by the Worker shim.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+    /// Returns the fixed named Query identity.
+    pub fn query_name(&self) -> &str {
+        &self.query_name
+    }
+    /// Returns the remote Query Worker origin, if split from this Worker.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+}
+
+impl GraphBinding {
+    /// Returns the environment binding name exposed by the Worker shim.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    /// Returns the fixed named graph identity.
+    pub fn graph_name(&self) -> &str {
+        &self.graph_name
+    }
+
+    /// Returns the remote Graph Worker origin, if split from this Worker.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+}
+
+impl VectorizeBinding {
+    /// Returns the environment binding name exposed by the Worker shim.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    /// Returns the fixed named Vectorize index identity.
+    pub fn index_name(&self) -> &str {
+        &self.index_name
+    }
+
+    /// Returns the remote Vectorize Worker origin, if split from this Worker.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+}
+
 impl PipelineBinding {
     /// Returns the environment binding name exposed by the Worker shim.
     pub fn binding(&self) -> &str {
@@ -60,7 +133,7 @@ impl PipelineBinding {
     }
 }
 
-/// The six and only six product artifact identities in a deployment.
+/// The nine product artifact identities in a deployment.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ArtifactProduct {
     /// Stateless public Worker artifact.
@@ -75,6 +148,12 @@ pub enum ArtifactProduct {
     Sink,
     /// Iceberg REST Catalog artifact.
     Catalog,
+    /// Turso-backed Cloudflare Vectorize artifact.
+    Vectorize,
+    /// Turso-backed bounded property-graph artifact.
+    Graph,
+    /// Turso-backed Pipeline materialization and bounded query artifact.
+    Query,
 }
 
 impl ArtifactProduct {
@@ -87,6 +166,9 @@ impl ArtifactProduct {
             Self::Pipeline => "pipeline",
             Self::Sink => "sink",
             Self::Catalog => "catalog",
+            Self::Vectorize => "vectorize",
+            Self::Graph => "graph",
+            Self::Query => "query",
         }
     }
 }
@@ -202,6 +284,17 @@ struct BindingTarget {
     product: ArtifactProduct,
 }
 
+/// Borrowed binding namespaces passed together through cross-namespace validation.
+struct BindingNamespaces<'a> {
+    durable_objects: &'a [Binding],
+    pipelines: &'a [PipelineBinding],
+    vectorize: &'a [VectorizeBinding],
+    graphs: &'a [GraphBinding],
+    queries: &'a [QueryBinding],
+    services: &'a [SystemBinding],
+    host_services: &'a [HostServiceBinding],
+}
+
 /// The validated subset of a Wrangler-style deployment manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
@@ -209,8 +302,12 @@ pub struct Manifest {
     main: String,
     compatibility_date: Option<String>,
     compatibility_flags: Vec<String>,
+    crons: Vec<String>,
     bindings: Vec<Binding>,
     pipelines: Vec<PipelineBinding>,
+    vectorize: Vec<VectorizeBinding>,
+    graphs: Vec<GraphBinding>,
+    queries: Vec<QueryBinding>,
     services: Vec<SystemBinding>,
     host_services: Vec<HostServiceBinding>,
     migrations: Vec<Migration>,
@@ -268,6 +365,11 @@ impl Manifest {
         &self.compatibility_flags
     }
 
+    /// Returns scheduled cron expressions in manifest order.
+    pub fn crons(&self) -> &[String] {
+        &self.crons
+    }
+
     /// Returns all declared Durable Object bindings in manifest order.
     pub fn bindings(&self) -> &[Binding] {
         &self.bindings
@@ -276,6 +378,21 @@ impl Manifest {
     /// Returns all declared system Stream bindings in manifest order.
     pub fn pipelines(&self) -> &[PipelineBinding] {
         &self.pipelines
+    }
+
+    /// Returns all declared Vectorize bindings in manifest order.
+    pub fn vectorize_bindings(&self) -> &[VectorizeBinding] {
+        &self.vectorize
+    }
+
+    /// Returns all declared Graph bindings in manifest order.
+    pub fn graph_bindings(&self) -> &[GraphBinding] {
+        &self.graphs
+    }
+
+    /// Returns all declared Query bindings in manifest order.
+    pub fn query_bindings(&self) -> &[QueryBinding] {
+        &self.queries
     }
 
     /// Returns all declared Pipeline, Sink, and Catalog service bindings.
@@ -329,6 +446,36 @@ impl Manifest {
             }
             return Ok(item.origin());
         }
+        if let Some(item) = self.vectorize.iter().find(|item| item.binding == binding) {
+            if item.index_name != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: item.index_name.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(item.origin());
+        }
+        if let Some(item) = self.graphs.iter().find(|item| item.binding == binding) {
+            if item.graph_name != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: item.graph_name.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(item.origin());
+        }
+        if let Some(item) = self.queries.iter().find(|item| item.binding == binding) {
+            if item.query_name != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: item.query_name.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(item.origin());
+        }
         if let Some(item) = self.services.iter().find(|item| item.binding == binding) {
             if item.object != object {
                 return Err(ManifestError::WrongBindingObject {
@@ -376,6 +523,21 @@ impl Manifest {
             .find(|pipeline| pipeline.binding == name)
     }
 
+    /// Looks up one Vectorize binding without merging it with DO namespaces.
+    pub fn vectorize(&self, name: &str) -> Option<&VectorizeBinding> {
+        self.vectorize.iter().find(|item| item.binding == name)
+    }
+
+    /// Looks up one Graph binding without merging it with DO namespaces.
+    pub fn graph(&self, name: &str) -> Option<&GraphBinding> {
+        self.graphs.iter().find(|item| item.binding == name)
+    }
+
+    /// Looks up one Query binding without merging it with DO namespaces.
+    pub fn query(&self, name: &str) -> Option<&QueryBinding> {
+        self.queries.iter().find(|item| item.binding == name)
+    }
+
     /// Resolves one binding while enforcing its declared object identity.
     fn binding_target(&self, binding: &str, object: &str) -> Result<BindingTarget, ManifestError> {
         if self.bindings.iter().any(|item| item.name == binding) {
@@ -393,6 +555,42 @@ impl Manifest {
             }
             return Ok(BindingTarget {
                 product: ArtifactProduct::Stream,
+            });
+        }
+        if let Some(index) = self.vectorize.iter().find(|item| item.binding == binding) {
+            if index.index_name != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: index.index_name.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(BindingTarget {
+                product: ArtifactProduct::Vectorize,
+            });
+        }
+        if let Some(graph) = self.graphs.iter().find(|item| item.binding == binding) {
+            if graph.graph_name != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: graph.graph_name.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(BindingTarget {
+                product: ArtifactProduct::Graph,
+            });
+        }
+        if let Some(query) = self.queries.iter().find(|item| item.binding == binding) {
+            if query.query_name != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: query.query_name.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(BindingTarget {
+                product: ArtifactProduct::Query,
             });
         }
         if let Some(service) = self.services.iter().find(|item| item.binding == binding) {
@@ -427,8 +625,12 @@ impl Manifest {
             "main",
             "compatibility_date",
             "compatibility_flags",
+            "triggers",
             "durable_objects",
             "pipelines",
+            "vectorize",
+            "graphs",
+            "queries",
             "services",
             "migrations",
             "vars",
@@ -456,6 +658,11 @@ impl Manifest {
             .map(|value| parse_string_array(value, "compatibility_flags"))
             .transpose()?
             .unwrap_or_default();
+        let crons = object
+            .remove("triggers")
+            .map(parse_triggers)
+            .transpose()?
+            .unwrap_or_default();
         let durable_objects = required_object(&mut object, "durable_objects")?;
         let bindings = parse_durable_objects(durable_objects)?;
         let pipelines = object
@@ -463,12 +670,36 @@ impl Manifest {
             .map(parse_pipelines)
             .transpose()?
             .unwrap_or_default();
+        let vectorize = object
+            .remove("vectorize")
+            .map(parse_vectorize)
+            .transpose()?
+            .unwrap_or_default();
+        let graphs = object
+            .remove("graphs")
+            .map(parse_graphs)
+            .transpose()?
+            .unwrap_or_default();
+        let queries = object
+            .remove("queries")
+            .map(parse_queries)
+            .transpose()?
+            .unwrap_or_default();
         let (services, host_services) = object
             .remove("services")
             .map(parse_services)
             .transpose()?
             .unwrap_or_default();
-        reject_binding_collisions(&bindings, &pipelines, &services, &host_services)?;
+        let namespaces = BindingNamespaces {
+            durable_objects: &bindings,
+            pipelines: &pipelines,
+            vectorize: &vectorize,
+            graphs: &graphs,
+            queries: &queries,
+            services: &services,
+            host_services: &host_services,
+        };
+        reject_binding_collisions(&namespaces)?;
         let migrations = object
             .remove("migrations")
             .map(parse_migrations)
@@ -480,15 +711,19 @@ impl Manifest {
             .transpose()?
             .unwrap_or_default();
         let artifacts = required_object(&mut object, "artifacts").and_then(parse_artifacts)?;
-        require_artifacts(&artifacts, &bindings, &pipelines, &services)?;
+        require_artifacts(&artifacts, &namespaces)?;
         let data_root = PathBuf::from(required_string(&mut object, "data_root")?);
         Ok(Self {
             name,
             main,
             compatibility_date,
             compatibility_flags,
+            crons,
             bindings,
             pipelines,
+            vectorize,
+            graphs,
+            queries,
             services,
             host_services,
             migrations,
@@ -535,6 +770,12 @@ pub enum ManifestError {
         /// Key that was not recognized.
         key: String,
     },
+    /// A scheduled-trigger object contains an unsupported key.
+    #[error("unknown triggers manifest key: {key}")]
+    UnknownTriggersKey {
+        /// Key that was not recognized.
+        key: String,
+    },
     /// A nested durable-object section contains an unknown key.
     #[error("unknown durable_objects manifest key: {key}")]
     UnknownDurableObjectsKey {
@@ -553,6 +794,24 @@ pub enum ManifestError {
         /// Key that was not recognized.
         key: String,
     },
+    /// A Vectorize binding contains an unknown key.
+    #[error("unknown vectorize manifest key: {key}")]
+    UnknownVectorizeKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// A Graph binding contains an unknown key.
+    #[error("unknown graphs manifest key: {key}")]
+    UnknownGraphKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// A Query binding contains an unknown key.
+    #[error("unknown queries manifest key: {key}")]
+    UnknownQueryKey {
+        /// Key that was not recognized.
+        key: String,
+    },
     /// A system service binding contains an unknown key.
     #[error("unknown services manifest key: {key}")]
     UnknownServiceKey {
@@ -562,7 +821,7 @@ pub enum ManifestError {
     /// A system service binding names an unsupported product.
     #[error("unknown service product: {product}")]
     UnknownServiceProduct {
-        /// Product string that was not one of the six products.
+        /// Product string that was not one of the nine products.
         product: String,
     },
     /// The artifacts object contains an unknown product key.
@@ -685,6 +944,24 @@ fn parse_string_array(value: Value, field: &'static str) -> Result<Vec<String>, 
         .collect()
 }
 
+/// Parses Wrangler's scheduled-trigger block while retaining strict key validation.
+fn parse_triggers(value: Value) -> Result<Vec<String>, ManifestError> {
+    let Value::Object(mut object) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "triggers",
+            expected: "object",
+        });
+    };
+    if let Some(key) = object.keys().find(|key| key.as_str() != "crons").cloned() {
+        return Err(ManifestError::UnknownTriggersKey { key });
+    }
+    object
+        .remove("crons")
+        .map(|value| parse_string_array(value, "triggers.crons"))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 /// Parses the worker environment object without interpreting or dropping values.
 fn parse_vars(value: Value) -> Result<Map<String, Value>, ManifestError> {
     let Value::Object(values) = value else {
@@ -785,6 +1062,123 @@ fn parse_pipelines(value: Value) -> Result<Vec<PipelineBinding>, ManifestError> 
     Ok(pipelines)
 }
 
+/// Parses the exact Cloudflare Vectorize binding array.
+fn parse_vectorize(value: Value) -> Result<Vec<VectorizeBinding>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "vectorize",
+            expected: "array",
+        });
+    };
+    let mut bindings = Vec::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
+    for value in values {
+        let Value::Object(mut object) = value else {
+            return Err(ManifestError::InvalidType {
+                field: "vectorize[]",
+                expected: "object",
+            });
+        };
+        if let Some(key) = object
+            .keys()
+            .find(|key| !["binding", "index_name", "origin"].contains(&key.as_str()))
+            .cloned()
+        {
+            return Err(ManifestError::UnknownVectorizeKey { key });
+        }
+        let binding = required_string(&mut object, "binding")?;
+        let index_name = required_string(&mut object, "index_name")?;
+        let origin = optional_origin(&mut object)?;
+        if !names.insert(binding.clone()) {
+            return Err(ManifestError::DuplicateBinding { name: binding });
+        }
+        bindings.push(VectorizeBinding {
+            binding,
+            index_name,
+            origin,
+        });
+    }
+    Ok(bindings)
+}
+
+/// Parses the strict Verglas Graph binding array.
+fn parse_graphs(value: Value) -> Result<Vec<GraphBinding>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "graphs",
+            expected: "array",
+        });
+    };
+    let mut bindings = Vec::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
+    for value in values {
+        let Value::Object(mut object) = value else {
+            return Err(ManifestError::InvalidType {
+                field: "graphs[]",
+                expected: "object",
+            });
+        };
+        if let Some(key) = object
+            .keys()
+            .find(|key| !["binding", "graph_name", "origin"].contains(&key.as_str()))
+            .cloned()
+        {
+            return Err(ManifestError::UnknownGraphKey { key });
+        }
+        let binding = required_string(&mut object, "binding")?;
+        let graph_name = required_string(&mut object, "graph_name")?;
+        let origin = optional_origin(&mut object)?;
+        if !names.insert(binding.clone()) {
+            return Err(ManifestError::DuplicateBinding { name: binding });
+        }
+        bindings.push(GraphBinding {
+            binding,
+            graph_name,
+            origin,
+        });
+    }
+    Ok(bindings)
+}
+
+/// Parses the strict Verglas Query binding array.
+fn parse_queries(value: Value) -> Result<Vec<QueryBinding>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "queries",
+            expected: "array",
+        });
+    };
+    let mut bindings = Vec::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
+    for value in values {
+        let Value::Object(mut object) = value else {
+            return Err(ManifestError::InvalidType {
+                field: "queries[]",
+                expected: "object",
+            });
+        };
+        if let Some(key) = object
+            .keys()
+            .find(|key| !["binding", "query_name", "origin"].contains(&key.as_str()))
+            .cloned()
+        {
+            return Err(ManifestError::UnknownQueryKey { key });
+        }
+        let binding = required_string(&mut object, "binding")?;
+        let query_name = required_string(&mut object, "query_name")?;
+        let origin = optional_origin(&mut object)?;
+        if !names.insert(binding.clone()) {
+            return Err(ManifestError::DuplicateBinding { name: binding });
+        }
+        bindings.push(QueryBinding {
+            binding,
+            query_name,
+            origin,
+        });
+    }
+    Ok(bindings)
+}
+
 /// Parses explicit prebuilt Pipeline, Sink, and Catalog service bindings.
 fn parse_services(
     value: Value,
@@ -849,35 +1243,79 @@ fn parse_services(
 }
 
 /// Rejects one environment binding from selecting multiple product namespaces.
-fn reject_binding_collisions(
-    bindings: &[Binding],
-    pipelines: &[PipelineBinding],
-    services: &[SystemBinding],
-    host_services: &[HostServiceBinding],
-) -> Result<(), ManifestError> {
+fn reject_binding_collisions(namespaces: &BindingNamespaces<'_>) -> Result<(), ManifestError> {
     let mut names = HashSet::new();
-    for name in bindings.iter().map(|binding| binding.name.as_str()) {
+    for name in namespaces
+        .durable_objects
+        .iter()
+        .map(|binding| binding.name.as_str())
+    {
         if !names.insert(name) {
             return Err(ManifestError::DuplicateBinding {
                 name: name.to_owned(),
             });
         }
     }
-    for name in pipelines.iter().map(|pipeline| pipeline.binding.as_str()) {
+    for name in namespaces
+        .pipelines
+        .iter()
+        .map(|pipeline| pipeline.binding.as_str())
+    {
         if !names.insert(name) {
             return Err(ManifestError::DuplicateBinding {
                 name: name.to_owned(),
             });
         }
     }
-    for name in services.iter().map(|service| service.binding.as_str()) {
+    for name in namespaces
+        .vectorize
+        .iter()
+        .map(|binding| binding.binding.as_str())
+    {
         if !names.insert(name) {
             return Err(ManifestError::DuplicateBinding {
                 name: name.to_owned(),
             });
         }
     }
-    for name in host_services.iter().map(|service| service.binding.as_str()) {
+    for name in namespaces
+        .graphs
+        .iter()
+        .map(|binding| binding.binding.as_str())
+    {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    for name in namespaces
+        .queries
+        .iter()
+        .map(|binding| binding.binding.as_str())
+    {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    for name in namespaces
+        .services
+        .iter()
+        .map(|service| service.binding.as_str())
+    {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    for name in namespaces
+        .host_services
+        .iter()
+        .map(|service| service.binding.as_str())
+    {
         if !names.insert(name) {
             return Err(ManifestError::DuplicateBinding {
                 name: name.to_owned(),
@@ -898,6 +1336,9 @@ fn parse_artifacts(
         "pipeline",
         "sink",
         "catalog",
+        "vectorize",
+        "graph",
+        "query",
     ]
     .into_iter()
     .collect::<HashSet<_>>();
@@ -917,6 +1358,9 @@ fn parse_artifacts(
             "pipeline" => ArtifactProduct::Pipeline,
             "sink" => ArtifactProduct::Sink,
             "catalog" => ArtifactProduct::Catalog,
+            "vectorize" => ArtifactProduct::Vectorize,
+            "graph" => ArtifactProduct::Graph,
+            "query" => ArtifactProduct::Query,
             _ => unreachable!("artifact keys were checked above"),
         };
         artifacts.insert(product, parse_artifact_descriptor(value)?);
@@ -959,30 +1403,68 @@ fn parse_artifact_descriptor(value: Value) -> Result<ArtifactDescriptor, Manifes
 /// Requires the Worker and every artifact selected by a declared binding.
 fn require_artifacts(
     artifacts: &BTreeMap<ArtifactProduct, ArtifactDescriptor>,
-    bindings: &[Binding],
-    pipelines: &[PipelineBinding],
-    services: &[SystemBinding],
+    namespaces: &BindingNamespaces<'_>,
 ) -> Result<(), ManifestError> {
     if !artifacts.contains_key(&ArtifactProduct::Worker) {
         return Err(ManifestError::MissingArtifact {
             product: ArtifactProduct::Worker.manifest_key(),
         });
     }
-    if bindings.iter().any(|binding| binding.origin.is_none())
+    if namespaces
+        .durable_objects
+        .iter()
+        .any(|binding| binding.origin.is_none())
         && !artifacts.contains_key(&ArtifactProduct::DurableObject)
     {
         return Err(ManifestError::MissingArtifact {
             product: ArtifactProduct::DurableObject.manifest_key(),
         });
     }
-    if pipelines.iter().any(|pipeline| pipeline.origin.is_none())
+    if namespaces
+        .pipelines
+        .iter()
+        .any(|pipeline| pipeline.origin.is_none())
         && !artifacts.contains_key(&ArtifactProduct::Stream)
     {
         return Err(ManifestError::MissingArtifact {
             product: ArtifactProduct::Stream.manifest_key(),
         });
     }
-    for service in services.iter().filter(|service| service.origin.is_none()) {
+    if namespaces
+        .vectorize
+        .iter()
+        .any(|binding| binding.origin.is_none())
+        && !artifacts.contains_key(&ArtifactProduct::Vectorize)
+    {
+        return Err(ManifestError::MissingArtifact {
+            product: ArtifactProduct::Vectorize.manifest_key(),
+        });
+    }
+    if namespaces
+        .graphs
+        .iter()
+        .any(|binding| binding.origin.is_none())
+        && !artifacts.contains_key(&ArtifactProduct::Graph)
+    {
+        return Err(ManifestError::MissingArtifact {
+            product: ArtifactProduct::Graph.manifest_key(),
+        });
+    }
+    if namespaces
+        .queries
+        .iter()
+        .any(|binding| binding.origin.is_none())
+        && !artifacts.contains_key(&ArtifactProduct::Query)
+    {
+        return Err(ManifestError::MissingArtifact {
+            product: ArtifactProduct::Query.manifest_key(),
+        });
+    }
+    for service in namespaces
+        .services
+        .iter()
+        .filter(|service| service.origin.is_none())
+    {
         if !artifacts.contains_key(&service.product) {
             return Err(ManifestError::MissingArtifact {
                 product: service.product.manifest_key(),

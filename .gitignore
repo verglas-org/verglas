@@ -27,9 +27,8 @@ dhat-heap.json
 # Claude Code / agent local worktrees
 .claude/worktrees/
 
-# TypeScript SDK (sdks/typescript) build/deps
+# JavaScript build/dependency output
 node_modules/
-sdks/**/dist/
 
 # Editor / OS noise
 .DS_Store

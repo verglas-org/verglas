@@ -6573,12 +6573,22 @@ name = "verglas-do-turso"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "futures",
+ "hex",
+ "object_store",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
  "turso",
+ "turso_core",
+ "verglas-backend",
+ "verglas-cache",
+ "verglas-core",
+ "verglas-s3",
 ]
 
 [[package]]
@@ -6604,8 +6614,10 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "futures",
  "hex",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6703,6 +6715,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "verglas-backend",
+ "verglas-cache",
  "verglas-core",
 ]
 
@@ -6938,6 +6951,7 @@ dependencies = [
  "once_cell",
  "postcard",
  "pulley-interpreter",
+ "rayon",
  "rustix 1.1.4",
  "semver",
  "serde",

@@ -1,5 +1,6 @@
-import { build as bundle } from '../../../sdks/worker-js/node_modules/esbuild/lib/main.js';
-import { createHandler, createWorker } from '../../../sdks/worker-js/src/cloudflare-workers.js';
+import { workerAssetPath } from '@verglas/worker-js/assets';
+import { createHandler, createWorker } from '@verglas/worker-js/cloudflare-workers';
+import { build as bundle } from 'esbuild';
 import { DatabaseSync } from 'node:sqlite';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -9,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
 const source = join(root, 'worker.js');
-const cloudflareWorkersPath = resolve(root, '../../sdks/worker-js/src/cloudflare-workers.js');
+const cloudflareWorkersPath = workerAssetPath('cloudflare-workers.js');
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 

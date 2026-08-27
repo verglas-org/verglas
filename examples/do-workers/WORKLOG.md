@@ -49,3 +49,9 @@
 - #171: Updated the factual harness to launch `verglasd`, use
   `--verglasd-control`, and keep its private socket and logs under that name.
   No old executable or argument alias is accepted.
+## #0 — 2026-08-26
+
+- Added a scheduled entry point to the JavaScript cold-chain acceptance Worker.
+- Each cron invocation performs the same durable increment and Stream publish as `POST /incr`, giving staging verification an observable end-to-end result.
+- The JavaScript cold-chain Worker now acknowledges `/process` after durable Pipeline enqueue instead of waiting for Stream, Sink, and Catalog. The acceptance harness polls independent stage status before asserting progress and restart idempotency.
+- #0: Run cold-chain component builds through the published JavaScript and Python SDK commands. The example no longer depends on SDK source trees or a private Python environment inside the runtime repository.

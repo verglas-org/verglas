@@ -15,7 +15,8 @@ This project is pre-release. The rules that follow from that are strict:
 One cargo workspace covers the whole repository. `crates/` holds the runtime
 infrastructure and narrow host capabilities. `system/` holds the prebuilt
 Worker/Durable Object products, including the Turso-backed Catalog. The
-TypeScript SDK under `sdks/typescript` is a separate package.
+JavaScript and Python Worker authoring toolchains and public documentation live
+in `verglas-org/verglas-sdk`.
 
 `cargo build --workspace` builds the Rust workspace. `just build`, `just test`,
 and `just lint` are the entry points.
@@ -40,7 +41,7 @@ Things that are easy to get wrong:
 
 ## Sources of truth
 
-1. **docs/architecture/whitepaper.mdx** — the architecture and its reasoning. Read the relevant section before implementing; if an implementation decision contradicts the whitepaper, stop and raise it rather than silently diverging.
+1. **The public architecture documentation in `verglas-org/verglas-sdk`** — the architecture and its reasoning. Read the relevant section before implementing; if an implementation decision contradicts it, stop and raise it rather than silently diverging.
 2. **GitHub issues** — every unit of work has an issue with Context / Work / Acceptance criteria. The acceptance criteria are the definition of done. Read the whole issue (including addenda after `---` separators) before writing code; cross-issue dependencies are tracked in the project board's "Blocked by" field.
 
 ## Worklog discipline (required for all transactions)

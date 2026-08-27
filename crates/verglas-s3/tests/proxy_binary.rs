@@ -15,5 +15,6 @@ fn help_describes_one_preprovisioned_bucket() {
     assert!(help.contains("--origin-bucket"));
     assert!(help.contains("--origin-credentials"));
     assert!(help.contains("--client-credentials"));
+    assert!(help.contains("--cache-config"));
     assert!(!help.contains("compile"));
 }

@@ -27,10 +27,7 @@ targets = [
 checksum = "sha256"
 # No release-plan job on PRs: releases are explicit tag pushes only.
 pr-run-mode = "skip"
-# Publish the TypeScript SDK after every target build is green.
-publish-jobs = ["./publish-sdk"]
 # Link the dynamic MSVC CRT for the Windows native dependencies.
 msvc-crt-static = false
 # Releases publish to this same public repo (verglas-org/verglas). No separate
 # releases-only override.
-

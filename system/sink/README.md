@@ -4,7 +4,7 @@ This is a literal Cloudflare-style Worker plus Durable Object deployment. Build
 it with the JavaScript SDK:
 
 ```sh
-node sdks/worker-js/bin/build.mjs system/sink --out /tmp/verglas-sink-build
+npx verglas-worker-build system/sink --out /tmp/verglas-sink-build
 ```
 
 The artifact has one Sink Durable Object class and one ordinary named Catalog

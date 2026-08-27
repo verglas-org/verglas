@@ -13,4 +13,4 @@ mod foyer_metrics;
 
 pub use block::BLOCK_SIZE_BYTES;
 pub use counters::{CacheCounters, CountersSnapshot};
-pub use engine::{EngineError, HybridCacheEngine};
+pub use engine::{EngineError, HybridCacheEngine, validate_cache_budgets};

@@ -6,12 +6,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { build as bundle } from '../../../sdks/worker-js/node_modules/esbuild/lib/main.js';
-import { createHandler, createWorker } from '../../../sdks/worker-js/src/cloudflare-workers.js';
+import { workerAssetPath } from '@verglas/worker-js/assets';
+import { createHandler, createWorker } from '@verglas/worker-js/cloudflare-workers';
+import { build as bundle } from 'esbuild';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
 const pipelineSource = join(root, 'worker.js');
-const cloudflareWorkersPath = resolve(root, '../../sdks/worker-js/src/cloudflare-workers.js');
+const cloudflareWorkersPath = workerAssetPath('cloudflare-workers.js');
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -21,6 +22,10 @@ class PersistedHost {
     this.sourceRecords = sourceRecords;
     this.sinkCalls = [];
     this.failSinks = new Set();
+    this.failStreamAcks = false;
+    this.streamRegistrations = [];
+    this.streamAcknowledgements = [];
+    this.ackObservedCursors = [];
     this.alarm = undefined;
     this.alarmHistory = [];
   }
@@ -37,13 +42,29 @@ class PersistedHost {
   doFetch(binding, object, request) {
     const url = new URL(request.uri);
     if (binding === 'STREAM') {
+      if (url.pathname === '/stream/consumers/register') {
+        const payload = JSON.parse(decoder.decode(request.body));
+        this.streamRegistrations.push(payload.consumer_id);
+        return response(200, { consumer_id: payload.consumer_id, acknowledged_through: 0, retained_through: 0 });
+      }
+      if (url.pathname === '/stream/consumers/ack') {
+        const payload = JSON.parse(decoder.decode(request.body));
+        this.streamAcknowledgements.push(payload);
+        this.ackObservedCursors.push(this.database.prepare('SELECT next_sequence FROM pipeline_cursor WHERE id = 1').get()?.next_sequence);
+        if (this.failStreamAcks && payload.next_after > 0) return response(503, { error: 'unavailable' });
+        return response(200, { consumer_id: payload.consumer_id, acknowledged_through: payload.next_after, retained_through: payload.next_after });
+      }
       const after = Number(url.searchParams.get('after'));
       const limit = Number(url.searchParams.get('limit'));
-      const records = this.sourceRecords
+      const positions = this.sourceRecords
         .filter(({ sequence }) => sequence > after)
         .slice(0, limit);
-      const nextAfter = records.length === 0 ? after : records.at(-1).sequence;
-      return response(200, { records, next_after: nextAfter });
+      const records = positions.filter((position) => Object.hasOwn(position, 'record'));
+      const skipped = positions
+        .filter((position) => Object.hasOwn(position, 'validation_family'))
+        .map(({ sequence, validation_family }) => ({ sequence, family: validation_family }));
+      const nextAfter = positions.length === 0 ? after : positions.at(-1).sequence;
+      return response(200, { records, next_after: nextAfter, ...(skipped.length > 0 ? { skipped } : {}) });
     }
     if (binding.startsWith('SINK_')) {
       const payload = JSON.parse(decoder.decode(request.body));
@@ -173,6 +194,20 @@ test('transforms and filters records with projection aliases', async (t) => {
   });
 });
 
+test('enqueue acknowledges durable Pipeline insertion before any downstream stage runs', async (t) => {
+  const fixture = await withProject(t, records({ id: 1, kind: 'buy', amount: 11 }));
+  const insertedAt = Date.now();
+  const queued = await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/enqueue'));
+  assert.equal(queued.status, 202);
+  assert.deepEqual(await readJson(queued), { pipeline_id: 'orders', queued: true });
+  assert.equal(fixture.host.sinkCalls.length, 0);
+  assert.ok(fixture.host.alarm >= insertedAt + 100);
+
+  await fixture.handler.alarm(fixture.host.alarm);
+  assert.equal(fixture.host.sinkCalls.length, 1);
+  assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 1);
+});
+
 test('fans one input stream out to two named sinks', async (t) => {
   const fixture = await withProject(t, records(
     { id: 1, kind: 'purchase', amount: 9 },
@@ -200,10 +235,55 @@ test('does not advance the cursor until every sink confirms', async (t) => {
   fixture.host.failSinks.add('SINK_B');
   assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 503);
   assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 0);
+  assert.deepEqual(fixture.host.streamAcknowledgements.map(({ next_after }) => next_after), [0]);
   fixture.host.failSinks.clear();
   assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
   assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 1);
   assert.equal(fixture.host.sinkCalls[1].payload.batch_id, fixture.host.sinkCalls[3].payload.batch_id);
+  assert.deepEqual(fixture.host.streamAcknowledgements.map(({ next_after }) => next_after), [0, 0, 1]);
+  assert.deepEqual(fixture.host.ackObservedCursors, [0, 0, 1]);
+});
+
+test('registers before reads and retries a lost retention acknowledgement after committing its cursor', async (t) => {
+  const fixture = await withProject(t, records({ id: 1 }), {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT * FROM events;',
+  });
+  fixture.host.failStreamAcks = true;
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 503);
+  assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 1);
+  fixture.host.failStreamAcks = false;
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 1);
+  assert.ok(fixture.host.streamRegistrations.length >= 2);
+  assert.deepEqual(fixture.host.streamAcknowledgements.at(-1), { consumer_id: 'orders', next_after: 1 });
+  assert.equal(fixture.host.ackObservedCursors.at(-1), 1);
+});
+
+test('advances and acknowledges across explicit Stream validation skips', async (t) => {
+  const fixture = await withProject(t, [
+    { sequence: 1, validation_family: 'unknown_field' },
+    { sequence: 2, record: { id: 2 } },
+    { sequence: 3, validation_family: 'type_mismatch' },
+  ], {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT * FROM events;',
+  });
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.deepEqual(fixture.host.sinkCalls.map(({ payload }) => payload.records), [[{ id: 2 }]]);
+  assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 3);
+  assert.deepEqual(fixture.host.streamAcknowledgements.map(({ next_after }) => next_after), [0, 3]);
+});
+
+test('advances and acknowledges an all-skipped Stream range without creating a Sink batch', async (t) => {
+  const fixture = await withProject(t, [
+    { sequence: 1, validation_family: 'unknown_field' },
+    { sequence: 2, validation_family: 'type_mismatch' },
+  ], {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT * FROM events;',
+  });
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.equal(fixture.host.sinkCalls.length, 0);
+  assert.equal((await readJson(await fixture.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 2);
+  assert.deepEqual(fixture.host.streamAcknowledgements.map(({ next_after }) => next_after), [0, 2]);
 });
 
 test('restarts retry the same durable batch identity', async (t) => {
@@ -266,9 +346,11 @@ test('immutable SQL digest mismatch hard-fails initialization', async (t) => {
   const first = await makeHandler(loaded.project, firstHost);
   firstHost.close();
   const secondHost = new PersistedHost(path);
-  const second = await makeHandler(loaded.project, secondHost, { PIPELINE_SQL: 'INSERT INTO primary_sink SELECT id FROM events;' });
+  const second = createHandler(loaded.project, manifest({
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT id FROM events;',
+  }), { transport: secondHost });
   await assert.rejects(
-    second.fetch(request('GET', 'https://verglas.internal/pipeline/status')),
+    second.init(),
     /immutable SQL mismatch|digest/i,
   );
   secondHost.close();

@@ -1,0 +1,6 @@
+{
+  "name": "verglas-dashboard",
+  "main": "worker.jsx",
+  "compatibility_date": "2026-08-26",
+  "queries": [{ "binding": "QUERY", "query_name": "analytics" }]
+}

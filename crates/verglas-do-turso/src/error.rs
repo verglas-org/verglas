@@ -11,6 +11,18 @@ pub enum Error {
     /// Reports an embedded Turso database failure.
     #[error("turso database error: {0}")]
     Turso(#[from] turso::Error),
+    /// Reports an object-store operation that could not establish durability.
+    #[error("Turso object-store operation failed: {0}")]
+    ObjectStore(#[from] object_store::Error),
+    /// Reports malformed or unavailable S3-CAS configuration.
+    #[error("invalid Turso S3-CAS configuration: {0}")]
+    StorageConfiguration(String),
+    /// Reports a non-contiguous or corrupt remote recovery lineage.
+    #[error("Turso S3-CAS recovery failed: {0}")]
+    Recovery(String),
+    /// Reports that another writer advanced the DO head first.
+    #[error("Turso S3-CAS conflict: {0}")]
+    Conflict(String),
     /// Reports a local sidecar filesystem failure.
     #[error("local Turso sidecar I/O failed: {0}")]
     Io(#[from] std::io::Error),

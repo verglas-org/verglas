@@ -3,7 +3,7 @@
 Build this literal Cloudflare-style Worker project with the JavaScript SDK:
 
 ```sh
-node sdks/worker-js/bin/build.mjs system/stream --out /tmp/verglas-stream-build
+npx verglas-worker-build system/stream --out /tmp/verglas-stream-build
 ```
 
 `STREAM_NAME` selects the named object identity. Set `STREAM_AUTH_TOKEN` to
@@ -59,3 +59,31 @@ a JSON array body. The bounded read route is
 exclusive and `limit` is at most 1000. An optional
 `x-verglas-producer-event-id` header supplies one identity for a one-record
 append or a JSON string array with one identity per record.
+
+## Consumer retention
+
+Pipeline remains the processing-cursor authority. Stream stores a separate,
+monotonic retention acknowledgment for each explicitly registered consumer:
+
+```text
+POST /stream/consumers/register { "consumer_id": "pipeline-id" }
+POST /stream/consumers/ack      { "consumer_id": "pipeline-id", "next_after": 42 }
+POST /stream/consumers/detach   { "consumer_id": "pipeline-id" }
+GET  /stream/retention
+```
+
+Registration starts at the Stream's already-collected watermark and is
+idempotent. Acknowledgment rejects unknown consumers and positions beyond the
+append head; replaying the same or a lower position is harmless. Stream deletes
+record and validation payload rows only through the minimum acknowledgment of
+all registered consumers. Collection is limited to 1000 positions per event;
+an immediate alarm continues any remaining work. Detach is explicit—an offline
+consumer never expires and cannot cause early deletion. Detaching recomputes
+the minimum immediately.
+
+Producer-event identity tombstones remain after payload collection, so a late
+producer retry returns its original sequence instead of appending a duplicate.
+A read below the collected watermark returns HTTP 410 with `retained_through`.
+Deleting SQL rows reclaims active logical records in the per-DO CAS database;
+physical reclamation of database pages and superseded immutable S3 blocks
+belongs to CAS lineage compaction and is not performed by the Stream component.

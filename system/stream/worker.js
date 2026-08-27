@@ -19,6 +19,10 @@ export const MAX_READ_LIMIT = 1000;
 export const METRICS_PATH = '/stream/metrics';
 export const APPEND_PATH = '/stream/append';
 export const READ_PATH = '/stream/read';
+export const CONSUMER_REGISTER_PATH = '/stream/consumers/register';
+export const CONSUMER_ACK_PATH = '/stream/consumers/ack';
+export const CONSUMER_DETACH_PATH = '/stream/consumers/detach';
+export const RETENTION_PATH = '/stream/retention';
 export const APPEND_URI = `https://verglas.internal${APPEND_PATH}`;
 
 export {
@@ -37,7 +41,11 @@ const TABLE = 'stream_records';
 const VALIDATION_TABLE = 'stream_record_validation';
 const CONFIG_TABLE = 'stream_config';
 const METRICS_TABLE = 'stream_metrics';
+const RETENTION_TABLE = 'stream_retention';
+const CONSUMER_TABLE = 'stream_consumers';
+const PRODUCER_EVENT_TABLE = 'stream_producer_events';
 const EVENT_ID_HEADER = 'x-verglas-producer-event-id';
+const RETENTION_ROWS_PER_EVENT = 1000;
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
 
 /**
@@ -98,7 +106,7 @@ export class Stream extends DurableObject {
   #schema;
 
   /**
-   * Handles only the two internal routes used by the Worker and Pipeline.
+   * Handles append/read plus the explicit Pipeline retention protocol.
    * @param {Request} request
    * @returns {Promise<Response>}
    */
@@ -109,7 +117,17 @@ export class Stream extends DurableObject {
     if (method === 'POST' && url.pathname === APPEND_PATH) return this.#append(request);
     if (method === 'GET' && url.pathname === READ_PATH) return this.#read(url);
     if (method === 'GET' && url.pathname === METRICS_PATH) return this.#metrics();
+    if (method === 'POST' && url.pathname === CONSUMER_REGISTER_PATH) return this.#registerConsumer(request);
+    if (method === 'POST' && url.pathname === CONSUMER_ACK_PATH) return this.#acknowledgeConsumer(request);
+    if (method === 'POST' && url.pathname === CONSUMER_DETACH_PATH) return this.#detachConsumer(request);
+    if (method === 'GET' && url.pathname === RETENTION_PATH) return this.#retention();
     return new Response('not found', { status: 404 });
+  }
+
+  /** Continues bounded retention collection outside the acknowledgment event. */
+  async alarm() {
+    await this.#ready;
+    await collectAcknowledged(ctxFor(this));
   }
 
   /**
@@ -157,22 +175,16 @@ export class Stream extends DurableObject {
       const eventId = eventIds[index];
       let existing;
       if (eventId !== undefined) {
-        existing = await execute(
-          ctx,
-          `SELECT r.sequence, v.sequence AS validation_sequence, v.validation_family FROM ${TABLE} r LEFT JOIN ${VALIDATION_TABLE} v ON v.sequence = r.sequence WHERE r.producer_event_id = ?`,
-          eventId,
-        );
+        existing = await execute(ctx, `SELECT sequence, validation_family FROM ${PRODUCER_EVENT_TABLE} WHERE producer_event_id = ?`, eventId);
       }
       if (existing?.length > 0) {
         sequences[index] = sequenceNumber(existing[0].sequence);
-        outcomes[index] = existing[0].validation_sequence === null || existing[0].validation_sequence === undefined
-          ? requestedFamilies[index]
-          : existing[0].validation_family ?? undefined;
+        outcomes[index] = existing[0].validation_family ?? undefined;
         continue;
       }
 
-      const next = await execute(ctx, `SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM ${TABLE}`);
-      const sequence = sequenceNumber(next[0]?.next_sequence);
+      const head = await retentionState(ctx);
+      const sequence = head.headSequence + 1;
       await execute(
         ctx,
         `INSERT INTO ${TABLE} (sequence, record_json, producer_event_id) VALUES (?, ?, ?)`,
@@ -186,6 +198,16 @@ export class Stream extends DurableObject {
         sequence,
         requestedFamilies[index] ?? null,
       );
+      if (eventId !== undefined) {
+        await execute(
+          ctx,
+          `INSERT INTO ${PRODUCER_EVENT_TABLE} (producer_event_id, sequence, validation_family) VALUES (?, ?, ?)`,
+          eventId,
+          sequence,
+          requestedFamilies[index] ?? null,
+        );
+      }
+      await execute(ctx, `UPDATE ${RETENTION_TABLE} SET head_sequence = ? WHERE id = 1`, sequence);
       sequences[index] = sequence;
       outcomes[index] = requestedFamilies[index];
     }
@@ -200,6 +222,81 @@ export class Stream extends DurableObject {
       invalid: errors.length,
       sequences,
       errors,
+    });
+  }
+
+  /** Registers one explicit retention consumer at the oldest available position. */
+  async #registerConsumer(request) {
+    const parsed = await consumerPayload(request, false);
+    if (parsed instanceof Response) return parsed;
+    const state = await retentionState(ctxFor(this));
+    await execute(
+      ctxFor(this),
+      `INSERT INTO ${CONSUMER_TABLE} (consumer_id, acknowledged_through) VALUES (?, ?) ON CONFLICT(consumer_id) DO NOTHING`,
+      parsed.consumerId,
+      state.retainedThrough,
+    );
+    const consumer = await consumerState(ctxFor(this), parsed.consumerId);
+    return jsonResponse({
+      consumer_id: parsed.consumerId,
+      acknowledged_through: consumer.acknowledgedThrough,
+      retained_through: state.retainedThrough,
+    });
+  }
+
+  /** Advances one consumer's retention acknowledgment monotonically. */
+  async #acknowledgeConsumer(request) {
+    const parsed = await consumerPayload(request, true);
+    if (parsed instanceof Response) return parsed;
+    const ctx = ctxFor(this);
+    const state = await retentionState(ctx);
+    const consumer = await consumerState(ctx, parsed.consumerId, false);
+    if (!consumer) return jsonResponse({ error: 'Stream consumer is not registered' }, 404);
+    if (parsed.nextAfter > state.headSequence) {
+      return jsonResponse({ error: 'consumer acknowledgement exceeds the Stream head' }, 400);
+    }
+    const acknowledgedThrough = Math.max(consumer.acknowledgedThrough, parsed.nextAfter);
+    await execute(
+      ctx,
+      `UPDATE ${CONSUMER_TABLE} SET acknowledged_through = ? WHERE consumer_id = ?`,
+      acknowledgedThrough,
+      parsed.consumerId,
+    );
+    const retainedThrough = await collectAcknowledged(ctx);
+    return jsonResponse({
+      consumer_id: parsed.consumerId,
+      acknowledged_through: acknowledgedThrough,
+      retained_through: retainedThrough,
+    });
+  }
+
+  /** Explicitly removes a consumer and recomputes the safe retention watermark. */
+  async #detachConsumer(request) {
+    const parsed = await consumerPayload(request, false);
+    if (parsed instanceof Response) return parsed;
+    const ctx = ctxFor(this);
+    const consumer = await consumerState(ctx, parsed.consumerId, false);
+    if (!consumer) return jsonResponse({ error: 'Stream consumer is not registered' }, 404);
+    await execute(ctx, `DELETE FROM ${CONSUMER_TABLE} WHERE consumer_id = ?`, parsed.consumerId);
+    const retainedThrough = await collectAcknowledged(ctx);
+    return jsonResponse({ consumer_id: parsed.consumerId, retained_through: retainedThrough });
+  }
+
+  /** Reports the append head, collected watermark, and explicit consumers. */
+  async #retention() {
+    const ctx = ctxFor(this);
+    const state = await retentionState(ctx);
+    const consumers = await execute(
+      ctx,
+      `SELECT consumer_id, acknowledged_through FROM ${CONSUMER_TABLE} ORDER BY consumer_id`,
+    );
+    return jsonResponse({
+      head_sequence: state.headSequence,
+      retained_through: state.retainedThrough,
+      consumers: consumers.map((consumer) => ({
+        consumer_id: String(consumer.consumer_id),
+        acknowledged_through: streamPosition(consumer.acknowledged_through, 'stored consumer acknowledgement'),
+      })),
     });
   }
 
@@ -221,6 +318,13 @@ export class Stream extends DurableObject {
     }
 
     const ctx = ctxFor(this);
+    const state = await retentionState(ctx);
+    if (after < state.retainedThrough) {
+      return jsonResponse({
+        error: 'requested Stream position has been collected',
+        retained_through: state.retainedThrough,
+      }, 410);
+    }
     const rows = await execute(
       ctx,
       `SELECT r.sequence, r.record_json, r.producer_event_id, v.validation_family FROM ${TABLE} r LEFT JOIN ${VALIDATION_TABLE} v ON v.sequence = r.sequence WHERE r.sequence > ? ORDER BY r.sequence ASC LIMIT ?`,
@@ -286,6 +390,92 @@ function ctxFor(object) {
   return object.ctx;
 }
 
+/** Parses the closed internal consumer-control payload. */
+async function consumerPayload(request, requireAcknowledgement) {
+  let value;
+  try {
+    value = await request.json();
+  } catch {
+    return jsonResponse({ error: 'consumer request body must be JSON' }, 400);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return jsonResponse({ error: 'consumer request body must be an object' }, 400);
+  }
+  const allowed = new Set(requireAcknowledgement ? ['consumer_id', 'next_after'] : ['consumer_id']);
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    return jsonResponse({ error: 'consumer request contains an unknown field' }, 400);
+  }
+  const consumerId = value.consumer_id;
+  if (typeof consumerId !== 'string' || !/^[^\u0000-\u001f\u007f]{1,256}$/u.test(consumerId)) {
+    return jsonResponse({ error: 'consumer_id must be 1-256 printable characters' }, 400);
+  }
+  if (!requireAcknowledgement) return { consumerId };
+  try {
+    return { consumerId, nextAfter: streamPosition(value.next_after, 'next_after') };
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 400);
+  }
+}
+
+/** Loads the Stream append head and logical collection watermark. */
+async function retentionState(ctx) {
+  const rows = await execute(ctx, `SELECT head_sequence, retained_through FROM ${RETENTION_TABLE} WHERE id = 1`);
+  if (rows.length !== 1) throw new Error('Stream retention row is missing');
+  return {
+    headSequence: streamPosition(rows[0].head_sequence, 'stored Stream head'),
+    retainedThrough: streamPosition(rows[0].retained_through, 'stored retention watermark'),
+  };
+}
+
+/** Loads one registered retention consumer. */
+async function consumerState(ctx, consumerId, required = true) {
+  const rows = await execute(
+    ctx,
+    `SELECT acknowledged_through FROM ${CONSUMER_TABLE} WHERE consumer_id = ?`,
+    consumerId,
+  );
+  if (rows.length === 0) {
+    if (required) throw new Error(`Stream consumer ${consumerId} is not registered`);
+    return undefined;
+  }
+  if (rows.length !== 1) throw new Error(`Stream consumer ${consumerId} is duplicated`);
+  return { acknowledgedThrough: streamPosition(rows[0].acknowledged_through, 'stored consumer acknowledgement') };
+}
+
+/** Deletes payload rows through the minimum explicit acknowledgment.
+ * Producer identity tombstones remain so a delayed producer retry cannot
+ * append a second copy after its original payload has been collected. */
+async function collectAcknowledged(ctx) {
+  const state = await retentionState(ctx);
+  const consumers = await execute(
+    ctx,
+    `SELECT COUNT(*) AS consumer_count, MIN(acknowledged_through) AS minimum_acknowledgement FROM ${CONSUMER_TABLE}`,
+  );
+  if (consumers.length !== 1) throw new Error('Stream consumer aggregate is missing');
+  const consumerCount = Number(consumers[0].consumer_count);
+  const target = consumerCount === 0
+    ? state.headSequence
+    : streamPosition(consumers[0].minimum_acknowledgement, 'minimum consumer acknowledgement');
+  const eligibleThrough = Math.max(state.retainedThrough, target);
+  const retainedThrough = Math.min(
+    eligibleThrough,
+    state.retainedThrough + RETENTION_ROWS_PER_EVENT,
+  );
+  if (retainedThrough === state.retainedThrough) {
+    await ctx.storage.deleteAlarm();
+    return retainedThrough;
+  }
+  await execute(ctx, `DELETE FROM ${VALIDATION_TABLE} WHERE sequence <= ?`, retainedThrough);
+  await execute(ctx, `DELETE FROM ${TABLE} WHERE sequence <= ?`, retainedThrough);
+  await execute(ctx, `UPDATE ${RETENTION_TABLE} SET retained_through = ? WHERE id = 1`, retainedThrough);
+  if (retainedThrough < eligibleThrough) {
+    await ctx.storage.setAlarm(Date.now());
+  } else {
+    await ctx.storage.deleteAlarm();
+  }
+  return retainedThrough;
+}
+
 /** @param {DurableObjectState} ctx @returns {Promise<void>} */
 async function createTables(ctx) {
   await execute(ctx, `CREATE TABLE IF NOT EXISTS ${TABLE} (
@@ -296,6 +486,20 @@ async function createTables(ctx) {
   await execute(ctx, `CREATE TABLE IF NOT EXISTS ${VALIDATION_TABLE} (
     sequence INTEGER PRIMARY KEY,
     validation_family TEXT
+  )`);
+  await execute(ctx, `CREATE TABLE IF NOT EXISTS ${PRODUCER_EVENT_TABLE} (
+    producer_event_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    validation_family TEXT
+  )`);
+  await execute(ctx, `CREATE TABLE IF NOT EXISTS ${RETENTION_TABLE} (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    head_sequence INTEGER NOT NULL,
+    retained_through INTEGER NOT NULL
+  )`);
+  await execute(ctx, `CREATE TABLE IF NOT EXISTS ${CONSUMER_TABLE} (
+    consumer_id TEXT PRIMARY KEY,
+    acknowledged_through INTEGER NOT NULL
   )`);
   await execute(ctx, `CREATE TABLE IF NOT EXISTS ${CONFIG_TABLE} (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -333,6 +537,10 @@ async function installOrCheckConfiguration(ctx, schema) {
       `INSERT INTO ${METRICS_TABLE} (id, input_bytes, input_records, decode_errors, user_errors_json, ordering_violations, backpressure_events, lag_records) VALUES (1, 0, 0, 0, ?, 0, 0, 0)`,
       JSON.stringify(emptyUserErrors()),
     );
+  }
+  const retention = await execute(ctx, `SELECT id FROM ${RETENTION_TABLE} WHERE id = 1`);
+  if (retention.length === 0) {
+    await execute(ctx, `INSERT INTO ${RETENTION_TABLE} (id, head_sequence, retained_through) VALUES (1, 0, 0)`);
   }
 }
 
@@ -381,6 +589,13 @@ function sequenceNumber(value) {
   const sequence = Number(value);
   if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error('stored sequence is invalid');
   return sequence;
+}
+
+/** Parses an inclusive Stream position, including the initial zero position. */
+function streamPosition(value, name) {
+  const position = Number(value);
+  if (!Number.isSafeInteger(position) || position < 0) throw new Error(`${name} is invalid`);
+  return position;
 }
 
 /** @param {string|null} header @param {number} count @returns {Array<string|undefined>} */

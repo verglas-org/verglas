@@ -6,12 +6,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { build as bundle } from '../../../sdks/worker-js/node_modules/esbuild/lib/main.js';
-import { createHandler, createWorker } from '../../../sdks/worker-js/src/cloudflare-workers.js';
+import { workerAssetPath } from '@verglas/worker-js/assets';
+import { createHandler, createWorker } from '@verglas/worker-js/cloudflare-workers';
+import { build as bundle } from 'esbuild';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
 const source = join(root, 'worker.js');
-const cloudflareWorkersPath = resolve(root, '../../sdks/worker-js/src/cloudflare-workers.js');
+const cloudflareWorkersPath = workerAssetPath('cloudflare-workers.js');
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const DIGEST = 'a'.repeat(64);

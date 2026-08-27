@@ -4,7 +4,7 @@ This is a literal Worker plus Durable Object deployment. Build it with the
 JavaScript SDK:
 
 ```sh
-node sdks/worker-js/bin/build.mjs system/pipeline --out /tmp/verglas-pipeline-build
+npx verglas-worker-build system/pipeline --out /tmp/verglas-pipeline-build
 ```
 
 ## Immutable configuration
@@ -118,6 +118,20 @@ sequence, last sequence, sink)`, encoded as JSON. A Sink confirms delivery with
 any 2xx response and must deduplicate this identity. The Pipeline resends the
 same body and identity after a crash or failure, and updates its cursor only
 after every targeted Sink confirms.
+
+Before reading, Pipeline idempotently registers `PIPELINE_ID` through
+`POST /stream/consumers/register` and catches up the Stream retention
+acknowledgment to its already-durable cursor. After every Sink confirms,
+Pipeline commits its local cursor, removes the pending batch, and only then
+sends `POST /stream/consumers/ack`. Losing that final request delays cleanup;
+it cannot delete data ahead of the Pipeline cursor. A later processing attempt
+replays the acknowledgment before reading more source positions. Deleting a
+Pipeline requires the control plane to call `POST /stream/consumers/detach`;
+there is no lease expiry for offline consumers.
+
+Stream validation skips are positions, not records. Pipeline verifies that the
+union of `records` and `skipped` is contiguous through `next_after`; it commits
+and acknowledges an all-skipped range without creating an empty Sink batch.
 
 The only Worker controls are `POST /pipeline/process-now` and
 `GET /pipeline/status`; all other paths return 404. A process-now call reads at

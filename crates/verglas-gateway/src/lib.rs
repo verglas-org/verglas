@@ -13,8 +13,8 @@ mod spawn;
 pub use error::GatewayError;
 pub use gateway::{Gateway, WorkerExecutor, WorkerPoolExecutor};
 pub use manifest::{
-    ArtifactDescriptor, ArtifactProduct, Binding, HostServiceBinding, Manifest, ManifestError,
-    Migration, PipelineBinding, SystemBinding,
+    ArtifactDescriptor, ArtifactProduct, Binding, GraphBinding, HostServiceBinding, Manifest,
+    ManifestError, Migration, PipelineBinding, QueryBinding, SystemBinding, VectorizeBinding,
 };
 pub use spawn::{DoSpawner, SpawnRequest, VerglasdSpawner};
 pub use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};

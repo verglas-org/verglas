@@ -6,11 +6,11 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildProject } from '../../../sdks/worker-js/bin/build.mjs';
+import { buildProject } from '@verglas/worker-js/build';
+import { workerToolPath } from '@verglas/worker-js/assets';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
-const sdk = resolve(root, '../../sdks/worker-js');
-const jco = join(sdk, 'node_modules/.bin/jco');
+const jco = workerToolPath('jco');
 
 test('Stream builds against the service world with only Worker capabilities', async (t) => {
   const output = await mkdtemp(join(tmpdir(), 'verglas-stream-component-'));

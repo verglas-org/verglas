@@ -10,12 +10,44 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};
 use verglas_gateway::{DoSpawner, Gateway, GatewayError, Manifest, SpawnRequest, WorkerExecutor};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Dispatches a control-plane-authenticated cron event without treating it as fetch traffic.
+#[tokio::test]
+async fn scheduled_route_invokes_worker_scheduled_export()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let fixture = Fixture::new().await?;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let gateway = Gateway::with_worker_executor_tokens(
+        &manifest(fixture.directory.path()),
+        fixture.directory.path().join("state"),
+        Arc::clone(&fixture.spawner) as Arc<dyn DoSpawner>,
+        Arc::new(ScheduledWorker(Arc::clone(&events))),
+        Some("ingress-test".to_owned()),
+        Some("schedule-test".to_owned()),
+    );
+    let address = start_gateway(gateway).await?;
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/__verglas/scheduled"))
+        .header("x-verglas-worker-ingress", "ingress-test")
+        .header("x-verglas-scheduled-token", "schedule-test")
+        .json(&json!({"scheduled_time": 1_800_000_u64, "cron": "*/5 * * * *"}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        *events.lock().await,
+        vec![(1_800_000, "*/5 * * * *".to_owned())]
+    );
+    Ok(())
+}
 
 /// Routes a public Worker fetch through the fake Worker's DO binding call.
 #[tokio::test]
@@ -92,8 +124,121 @@ async fn public_websocket_accept_is_guest_driven()
     Ok(())
 }
 
+/// Delivers a hibernated edge socket as discrete authenticated events and
+/// returns committed guest effects through the supplied callback.
+#[tokio::test]
+async fn hibernating_websocket_events_do_not_require_an_upstream_socket()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let fixture = Fixture::new().await?;
+    let event = spawn_hibernating_websocket_server(fixture.socket_path("alice"), 42).await?;
+    let (effect_tx, mut effect_rx) = mpsc::unbounded_channel::<Value>();
+    let callback = axum::Router::new().route(
+        "/effect",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let effect_tx = effect_tx.clone();
+            async move {
+                effect_tx
+                    .send(body)
+                    .map_err(|_| axum::http::StatusCode::GONE)?;
+                Ok::<_, axum::http::StatusCode>(axum::http::StatusCode::NO_CONTENT)
+            }
+        }),
+    );
+    let callback_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let callback_address = callback_listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(callback_listener, callback).await });
+
+    let gateway = Gateway::with_worker_executor_tokens(
+        &manifest(fixture.directory.path()),
+        fixture.directory.path().join("state"),
+        Arc::clone(&fixture.spawner) as Arc<dyn DoSpawner>,
+        Arc::new(BindingWorker),
+        Some("ingress-test".to_owned()),
+        Some("websocket-test".to_owned()),
+    );
+    let address = start_gateway(gateway).await?;
+    let client = reqwest::Client::new();
+    let auth = |request: reqwest::RequestBuilder| {
+        request
+            .header("x-verglas-worker-ingress", "ingress-test")
+            .header("x-verglas-websocket-token", "websocket-test")
+    };
+    let opened = auth(client.post(format!("http://{address}/__verglas/websocket/open")))
+        .json(&json!({
+            "socket_id": 42_u64,
+            "callback_url": format!("http://{callback_address}/effect"),
+            "request": {"method":"GET", "url":"/socket", "headers":[], "body_b64":""}
+        }))
+        .send()
+        .await?;
+    assert_eq!(opened.status(), reqwest::StatusCode::OK);
+
+    let message = auth(client.post(format!("http://{address}/__verglas/websocket/message")))
+        .json(&json!({
+            "socket_id": 42_u64,
+            "binding":"COUNTER","name":"alice",
+            "callback_url":format!("http://{callback_address}/effect"),
+            "text": true,
+            "data_b64": base64::engine::general_purpose::STANDARD.encode("hello")
+        }))
+        .send()
+        .await?;
+    assert_eq!(message.status(), reqwest::StatusCode::NO_CONTENT);
+    let effect = tokio::time::timeout(std::time::Duration::from_secs(2), effect_rx.recv())
+        .await?
+        .ok_or("missing callback effect")?;
+    assert_eq!(effect["socket_id"], 42);
+    assert_eq!(effect["type"], "message");
+    assert_eq!(effect["text"], true);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(effect["data_b64"].as_str().ok_or("missing effect body")?)?,
+        b"echo"
+    );
+
+    let closed = auth(client.post(format!("http://{address}/__verglas/websocket/close")))
+        .json(&json!({
+            "socket_id":42_u64,"binding":"COUNTER","name":"alice",
+            "callback_url":format!("http://{callback_address}/effect"),
+            "code":1000,"reason":"done"
+        }))
+        .send()
+        .await?;
+    assert_eq!(closed.status(), reqwest::StatusCode::NO_CONTENT);
+    event.await??;
+    Ok(())
+}
+
 /// Worker executor fake that performs the binding call expected from a module Worker.
 struct BindingWorker;
+
+/// Records scheduled events delivered through the gateway's private route.
+struct ScheduledWorker(Arc<Mutex<Vec<(u64, String)>>>);
+
+#[async_trait]
+impl WorkerExecutor for ScheduledWorker {
+    /// This fake does not serve public fetch traffic.
+    async fn fetch(
+        &self,
+        _request: WorkerRequest,
+        _router: Arc<dyn DoRouter>,
+    ) -> Result<WorkerResponse, GatewayError> {
+        Err(GatewayError::WorkerError {
+            message: "unexpected fetch".to_owned(),
+        })
+    }
+
+    /// Records the exact scheduled event.
+    async fn scheduled(
+        &self,
+        scheduled_epoch_millis: u64,
+        cron: String,
+        _router: Arc<dyn DoRouter>,
+    ) -> Result<(), GatewayError> {
+        self.0.lock().await.push((scheduled_epoch_millis, cron));
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl WorkerExecutor for BindingWorker {
@@ -241,6 +386,62 @@ async fn spawn_fetch_server(
                 .await?;
         }
         let _ = websocket;
+        Ok(())
+    }))
+}
+
+/// Serves one logical WebSocket whose transport is a Cloudflare callback,
+/// not a persistent TCP upgrade to this gateway.
+async fn spawn_hibernating_websocket_server(
+    path: PathBuf,
+    expected_ws: u64,
+) -> Result<
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let listener = UnixListener::bind(&path)?;
+    Ok(tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+        let fetch: Value = serde_json::from_str(&lines.next_line().await?.ok_or("missing fetch")?)?;
+        assert_eq!(fetch["type"], "fetch");
+        assert_eq!(fetch["ws"], expected_ws);
+        write_half
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "type":"fetch-result", "id":fetch["id"], "status":101,
+                        "headers":[], "body_b64":"", "accept_ws":expected_ws,
+                    })
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let open: Value = serde_json::from_str(&lines.next_line().await?.ok_or("missing open")?)?;
+        assert_eq!(open, json!({"type":"ws-open","ws":expected_ws}));
+        let message: Value =
+            serde_json::from_str(&lines.next_line().await?.ok_or("missing message")?)?;
+        assert_eq!(message["type"], "ws-message");
+        write_half
+            .write_all(
+                format!(
+                    "{}\n{}\n",
+                    json!({
+                        "type":"ws-send", "ws":expected_ws, "text":true,
+                        "data_b64":base64::engine::general_purpose::STANDARD.encode("echo"),
+                    }),
+                    json!({"type":"done","id":message["id"]}),
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let close: Value = serde_json::from_str(&lines.next_line().await?.ok_or("missing close")?)?;
+        assert_eq!(close["type"], "ws-close");
+        write_half
+            .write_all(format!("{}\n", json!({"type":"done","id":close["id"]})).as_bytes())
+            .await?;
         Ok(())
     }))
 }

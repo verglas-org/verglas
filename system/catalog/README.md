@@ -4,7 +4,7 @@ This is the prebuilt Catalog product: one ordinary Worker and one Turso-backed
 Durable Object. Build it with the JavaScript SDK:
 
 ```sh
-node sdks/worker-js/bin/build.mjs system/catalog --out /tmp/verglas-catalog-build
+npx verglas-worker-build system/catalog --out /tmp/verglas-catalog-build
 ```
 
 The component contains no storage client, file-format writer, provider

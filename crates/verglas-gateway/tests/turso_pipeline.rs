@@ -153,6 +153,8 @@ async fn gateway_routes_each_product_to_its_artifact()
         ("PIPELINE", "pipeline-1", PIPELINE_DIGEST),
         ("SINK", "sink-1", SINK_DIGEST),
         ("CATALOG", "catalog-1", CATALOG_DIGEST),
+        ("VECTORIZE", "vectors-1", VECTORIZE_DIGEST),
+        ("GRAPH", "knowledge-1", GRAPH_DIGEST),
     ];
     for (binding, object, digest) in cases {
         let response = reqwest::get(format!("http://{address}/do/{binding}/{object}")).await?;
@@ -176,6 +178,9 @@ const STREAM_DIGEST: &str = "333333333333333333333333333333333333333333333333333
 const PIPELINE_DIGEST: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 const SINK_DIGEST: &str = "5555555555555555555555555555555555555555555555555555555555555555";
 const CATALOG_DIGEST: &str = "6666666666666666666666666666666666666666666666666666666666666666";
+const VECTORIZE_DIGEST: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+const GRAPH_DIGEST: &str = "8888888888888888888888888888888888888888888888888888888888888888";
+const QUERY_DIGEST: &str = "9999999999999999999999999999999999999999999999999999999999999999";
 
 fn composition_manifest_source() -> String {
     format!(
@@ -184,6 +189,9 @@ fn composition_manifest_source() -> String {
             "main":"worker.js",
             "durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},
             "pipelines":[{{"binding":"STREAM","stream":"stream-1"}}],
+            "vectorize":[{{"binding":"VECTORIZE","index_name":"vectors-1"}}],
+            "graphs":[{{"binding":"GRAPH","graph_name":"knowledge-1"}}],
+            "queries":[{{"binding":"QUERY","query_name":"analytics-1"}}],
             "services":[
                 {{"binding":"PIPELINE","service":"pipeline","object":"pipeline-1"}},
                 {{"binding":"SINK","service":"sink","object":"sink-1"}},
@@ -197,6 +205,9 @@ fn composition_manifest_source() -> String {
                 "pipeline":{{"digest":"{PIPELINE_DIGEST}","component_dir":"pipeline"}},
                 "sink":{{"digest":"{SINK_DIGEST}","component_dir":"sink"}},
                 "catalog":{{"digest":"{CATALOG_DIGEST}","component_dir":"catalog"}}
+                ,"vectorize":{{"digest":"{VECTORIZE_DIGEST}","component_dir":"vectorize"}}
+                ,"graph":{{"digest":"{GRAPH_DIGEST}","component_dir":"graph"}}
+                ,"query":{{"digest":"{QUERY_DIGEST}","component_dir":"query"}}
             }},
             "data_root":"state"
         }}"#
@@ -228,6 +239,14 @@ fn product_bindings_select_distinct_artifacts() {
             ArtifactProduct::Catalog,
             CATALOG_DIGEST,
         ),
+        (
+            "VECTORIZE",
+            "vectors-1",
+            ArtifactProduct::Vectorize,
+            VECTORIZE_DIGEST,
+        ),
+        ("GRAPH", "knowledge-1", ArtifactProduct::Graph, GRAPH_DIGEST),
+        ("QUERY", "analytics-1", ArtifactProduct::Query, QUERY_DIGEST),
     ];
     for (binding, object, product, digest) in cases {
         assert_eq!(
@@ -266,7 +285,7 @@ fn product_bindings_select_distinct_artifacts() {
     }
 }
 
-/// Runtime host capabilities remain infrastructure and require no seventh artifact.
+/// Runtime host capabilities remain infrastructure and require no product artifact.
 #[test]
 fn runtime_commit_service_is_a_narrow_host_capability() {
     let manifest = Manifest::parse(&composition_manifest_source()).expect("composition manifest");
@@ -478,6 +497,27 @@ async fn product_bindings_forward_distinct_commands_and_restart_identity()
             CATALOG_DIGEST,
             "catalog",
         ),
+        (
+            "VECTORIZE",
+            "vectors-1",
+            ArtifactProduct::Vectorize,
+            VECTORIZE_DIGEST,
+            "vectorize",
+        ),
+        (
+            "GRAPH",
+            "knowledge-1",
+            ArtifactProduct::Graph,
+            GRAPH_DIGEST,
+            "graph",
+        ),
+        (
+            "QUERY",
+            "analytics-1",
+            ArtifactProduct::Query,
+            QUERY_DIGEST,
+            "query",
+        ),
     ];
     for (binding, object, product, digest, component_dir) in cases {
         assert_eq!(manifest.product_for_binding(binding, object)?, product);
@@ -569,7 +609,7 @@ fn unknown_artifact_descriptor_fails_closed() {
     assert!(error.to_string().contains("unknown artifact descriptor"));
 }
 
-/// A service binding cannot name an unsupported seventh product.
+/// A service binding cannot name an unsupported product.
 #[test]
 fn unknown_service_product_fails_closed() {
     let source =

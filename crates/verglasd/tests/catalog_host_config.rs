@@ -84,6 +84,30 @@ async fn non_catalog_request_never_forwards_catalog_host_path() {
     stop_child(&provisioner, &mut child).await;
 }
 
+/// Every DO product receives the same per-object storage capability; this is
+/// what prevents Stream and ordinary DOs from falling back to local SQLite.
+#[tokio::test]
+async fn storage_host_path_is_forwarded_to_every_product() {
+    let root = tempfile::tempdir().expect("cell root");
+    let config_path = root.path().join("object-storage.json");
+    let provisioner = LocalProcessProvisioner::new().with_storage_host_config(&config_path);
+    let (request, data_dir) = request(root.path(), None);
+
+    let mut child = provisioner.spawn(request).await.expect("spawn DO child");
+    provisioner
+        .await_ready(&mut child)
+        .await
+        .expect("child ready");
+    let argv = std::fs::read_to_string(data_dir.join("argv.txt")).expect("argv dump");
+    let lines: Vec<&str> = argv.lines().collect();
+    let flag = lines
+        .iter()
+        .position(|line| *line == "--storage-host-config")
+        .expect("storage host flag");
+    assert_eq!(lines[flag + 1], config_path.display().to_string());
+    stop_child(&provisioner, &mut child).await;
+}
+
 /// A Catalog request without operator configuration fails before filesystem or process spawn.
 #[tokio::test]
 async fn catalog_request_without_host_path_fails_closed_before_spawn() {

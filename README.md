@@ -1,6 +1,6 @@
 # Verglas
 
-Verglas has exactly six products, all composed from two primitives:
+Verglas has exactly nine products, all composed from two primitives:
 
 - **Worker** — stateless, pool-executed ingress with authority only from bindings.
 - **Durable Object** — a serialized stateful Worker class backed by one
@@ -12,11 +12,21 @@ Verglas has exactly six products, all composed from two primitives:
   adapter.
 - **Catalog** — a prebuilt Worker/DO exposing Iceberg REST through the existing
   Iceberg and catalog libraries.
+- **Vectorize** — a prebuilt Worker/DO exposing Cloudflare-shaped vector CRUD
+  and search over native Turso vectors.
+- **Graph** — a prebuilt Worker/DO exposing bounded property-graph CRUD and
+  traversal over Turso adjacency indexes.
+- **Query** — a prebuilt Worker/DO that directly consumes Pipeline batches and
+  maintains bounded, declared aggregate views and query endpoints in Turso.
+`system/dashboard` is a stateless Worker specialization, not an additional
+product. It queries declared Query bindings on demand and owns no durable state.
 
 This repository also contains the host runtime, Foyer cache, origin adapter,
 Iceberg commit library, and Catalog libraries used by those products. These are
-implementation layers, not additional products. The TypeScript SDK and RIME
-package are client/tooling surfaces.
+implementation layers, not additional products. The JavaScript and Python
+Worker SDKs, CLI, and public documentation live in
+[`verglas-org/verglas-sdk`](https://github.com/verglas-org/verglas-sdk). RIME
+remains the repository-local agent integration.
 
 [![ci](https://github.com/verglas-org/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 [![coverage](https://img.shields.io/badge/coverage-77%25_measured%2C_ratcheting-green)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
@@ -29,13 +39,12 @@ package are client/tooling surfaces.
   Foyer tiered caching, origin access, and narrow host capabilities.
 - `system/catalog`: the Turso-backed Catalog Worker/Durable Object product.
 - `crates/verglas-iceberg`: the runtime's narrow deterministic commit capability.
-- `sdks/typescript`: the public TypeScript SDK.
 - `rime`: the RIME package for supported agent hosts.
 - The reusable Rust crates that implement the storage, cache, catalog, and
   server roles.
 
 Hosted access, product provisioning, and the private cloud console remain
-outside this repository. They do not add a seventh product.
+outside this repository. They do not add another product.
 
 ## License
 
@@ -44,14 +53,6 @@ Verglas is available under the Functional Source License 1.1 with an Apache
 Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
-
-## Install
-
-Install the TypeScript SDK from npm:
-
-```sh
-npm install @verglas/sdk
-```
 
 The Worker/Durable Object runtime is self-hosted from this workspace. Product
 components are authored with the JavaScript and Python SDKs and run through the
@@ -66,11 +67,11 @@ just test
 just lint
 ```
 
-The TypeScript SDK lives under `sdks/typescript`; RIME lives under `rime/`.
-
-The [architecture overview](docs/architecture/overview.mdx) explains the six
-products and their shared Wasmtime runtime, Foyer cache, origin adapter, and
-Iceberg Catalog capability.
+Install the Worker authoring SDKs from
+[`verglas-org/verglas-sdk`](https://github.com/verglas-org/verglas-sdk); RIME
+lives under `rime/`. The public
+[architecture documentation](https://github.com/verglas-org/verglas-sdk/tree/main/docs/architecture)
+explains the nine products and their shared runtime.
 Every crate and binary keeps an append-only `WORKLOG.md` describing why it
 changed.
 
