@@ -18,8 +18,6 @@ const KNOWN_COMMANDS = new Set([
   "lakehouse",
   "secret",
   "token",
-  "graph",
-  "vector",
   "help",
 ]);
 
@@ -55,8 +53,8 @@ const CODE_SPAN_PATTERN = /```[\s\S]*?```|`[^`\n]+`/g;
 
 /**
  * Extracts every `verglas <command>` reference from a code span's text.
- * Flag tokens (leading `-`) are skipped so `verglas --json graph` resolves
- * to command `graph`. Returns the list of top-level command tokens found.
+ * Flag tokens (leading `-`) are skipped so `verglas --json status` resolves
+ * to command `status`. Returns the list of top-level command tokens found.
  */
 function extractCommands(spanText) {
   const commands = [];

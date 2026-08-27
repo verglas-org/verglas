@@ -1,11 +1,10 @@
 //! Building an Iceberg REST catalog from a resolved [`Connection`].
 //!
 //! Production verbs speak directly to the configured Iceberg REST catalog.
-//! Data files are read and
-//! written through the S3 endpoint the connection names (the server endpoint, by
-//! default), so a warm query stays local and a write gets cache residency and
-//! write-back. The storage factory is the S3 OpenDAL backend configured with
-//! that endpoint and the endpoint keypair.
+//! Data files are written through the origin endpoint named by the host-owned
+//! connection. Local Foyer residency is disposable acceleration and is never a
+//! publication authority. The storage factory is the S3 OpenDAL backend
+//! configured with that endpoint and its host-owned keypair.
 //!
 //! Hermetic tests build their own [`iceberg::Catalog`] (a `MemoryCatalog` over a
 //! local filesystem warehouse) and call the operation functions directly, so

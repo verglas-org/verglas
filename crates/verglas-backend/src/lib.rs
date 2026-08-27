@@ -251,6 +251,113 @@ pub trait BackendStores: Send + Sync {
     }
 }
 
+/// Exact logical-to-physical bucket mapping for one managed binding.
+///
+/// Component artifacts use a stable logical bucket so their bytes are shared
+/// across deployments. The cloud host keeps provider bucket names unique and
+/// installs this adapter at the trusted boundary.
+pub struct BucketAliasStores {
+    inner: Arc<dyn BackendStores>,
+    storage_binding_id: String,
+    logical_bucket: String,
+    physical_bucket: String,
+}
+
+impl BucketAliasStores {
+    /// Creates one closed mapping. No other binding or bucket is admitted.
+    pub fn new(
+        inner: Arc<dyn BackendStores>,
+        storage_binding_id: impl Into<String>,
+        logical_bucket: impl Into<String>,
+        physical_bucket: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            storage_binding_id: storage_binding_id.into(),
+            logical_bucket: logical_bucket.into(),
+            physical_bucket: physical_bucket.into(),
+        }
+    }
+
+    /// Validates the public route before returning the private provider name.
+    fn physical<'a>(
+        &'a self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<&'a str, BackendError> {
+        if storage_binding_id != self.storage_binding_id {
+            return Err(BackendError::UnknownStorageBinding {
+                storage_binding_id: storage_binding_id.to_owned(),
+            });
+        }
+        if bucket != self.logical_bucket {
+            return Err(BackendError::NoSuchBucket {
+                requested: bucket.to_owned(),
+                configured: self.logical_bucket.clone(),
+            });
+        }
+        Ok(&self.physical_bucket)
+    }
+}
+
+impl BackendStores for BucketAliasStores {
+    /// Resolves the logical bucket through the exact physical provider bucket.
+    fn store_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Arc<dyn MultipartObjectStore>, BackendError> {
+        let physical = self.physical(storage_binding_id, bucket)?;
+        self.inner.store_for(storage_binding_id, physical)
+    }
+
+    /// Resolves breaker state through the same closed mapping.
+    fn breaker_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Option<Arc<CircuitBreaker>>, BackendError> {
+        let physical = self.physical(storage_binding_id, bucket)?;
+        self.inner.breaker_for(storage_binding_id, physical)
+    }
+
+    /// Resolves the raw S3 path through the same closed mapping.
+    fn raw_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Option<Arc<ResilientRawS3>>, BackendError> {
+        let physical = self.physical(storage_binding_id, bucket)?;
+        self.inner.raw_for(storage_binding_id, physical)
+    }
+}
+
+/// Matches a bucket pattern where `*` consumes any run of characters.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pattern_index, mut text_index) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while text_index < text.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some((pattern_index + 1, text_index));
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == text[text_index] {
+            pattern_index += 1;
+            text_index += 1;
+        } else if let Some((after_star, consumed)) = star {
+            star = Some((after_star, consumed + 1));
+            pattern_index = after_star;
+            text_index = consumed + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_index..]
+        .iter()
+        .all(|character| *character == '*')
+}
+
 /// The set of buckets a node serves (#235): an optional single `bucket` plus a
 /// list of glob patterns. A request's bucket is served if it equals the single
 /// bucket or matches a glob. This is the one gate every serving path consults.
@@ -287,7 +394,7 @@ impl BucketSet {
         }
         self.globs
             .iter()
-            .any(|pattern| verglas_core::glob::matches(pattern, bucket))
+            .any(|pattern| glob_matches(pattern, bucket))
     }
 
     /// A one-line description for the startup log / error text: the single
@@ -332,7 +439,7 @@ struct BucketClients {
 type ClientBuilder = Box<dyn Fn(&str) -> Result<BucketClients, BackendError> + Send + Sync>;
 
 /// The backend store. Serves a [`BucketSet`], building each served bucket's
-/// [`BucketClients`] lazily on first request and memoizing them. A request for a
+/// internal clients lazily on first request and memoizing them. A request for a
 /// bucket outside the set is rejected with [`BackendError::NoSuchBucket`]; the
 /// server never builds a client for a bucket it does not serve.
 pub struct BackendStore {
@@ -484,7 +591,7 @@ impl BackendStore {
     }
 
     /// A single-bucket store whose typed store comes from `factory`, called once
-    /// on first request for `bucket`. Convenience over [`with_glob_factory`] for
+    /// on first request for `bucket`. Convenience over [`Self::with_glob_factory`] for
     /// tests that serve exactly one bucket. A build failure propagates.
     pub fn with_factory<F>(
         storage_binding_id: impl Into<String>,

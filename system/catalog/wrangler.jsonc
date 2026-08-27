@@ -1,0 +1,24 @@
+{
+  "name": "verglas-catalog",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "CATALOG_DO", "class_name": "Catalog" }
+    ]
+  },
+  "services": [
+    { "binding": "ICEBERG_COMMIT", "service": "verglas-runtime" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Catalog"] }
+  ],
+  "vars": {
+    "CATALOG_ID": "warehouse",
+    "CATALOG_WAREHOUSE": "warehouse",
+    "CATALOG_BUCKET": "lake",
+    "CATALOG_NAMESPACE": "analytics",
+    "CATALOG_TABLE": "events",
+    "CATALOG_SINK_ID": "primary_sink"
+  }
+}

@@ -27,9 +27,8 @@ dhat-heap.json
 # Claude Code / agent local worktrees
 .claude/worktrees/
 
-# TypeScript SDK (sdks/typescript) build/deps
+# JavaScript build/dependency output
 node_modules/
-sdks/**/dist/
 
 # Editor / OS noise
 .DS_Store
@@ -48,3 +47,4 @@ sdks/**/dist/
 # Python
 __pycache__/
 *.py[cod]
+.pnpm-store/

@@ -1,0 +1,144 @@
+// The verglas:do world: the ABI every Durable Object Worker component targets.
+//
+// Exports are the event surface the host (verglas-runtime) invokes; imports are the
+// capabilities the host grants. Storage is bound in-process to the Turso-backed
+// DO runtime, never over a network hop.
+
+package verglas:do-worker@0.1.0;
+
+interface types {
+  /// Identifies one accepted WebSocket held open by the gateway.
+  type websocket-id = u64;
+
+  /// One HTTP request delivered to a Worker or Durable Object fetch handler.
+  record request {
+    method: string,
+    uri: string,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+    /// The gateway's pending upgrade identity, when this request asked for a WebSocket.
+    ws: option<websocket-id>,
+  }
+
+  /// The response to one Worker or Durable Object fetch event.
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+    /// The pending WebSocket accepted by the guest, when the response completes an upgrade.
+    accept-ws: option<websocket-id>,
+  }
+
+  /// A handler failure. The host maps this onto its event outcome; it never
+  /// rolls back the DO's committed state.
+  record handler-error {
+    message: string,
+  }
+}
+
+interface storage {
+  use types.{handler-error};
+
+  /// Reads one key from the DO's transactional KV surface at the event's
+  /// snapshot fence.
+  get: func(key: string) -> result<option<list<u8>>, handler-error>;
+
+  /// Stages one write into the event's transaction. Visible to later reads in
+  /// the same event; durable only when the event's envelope commits.
+  put: func(key: string, value: list<u8>) -> result<_, handler-error>;
+
+  /// Stages one delete into the event's transaction.
+  delete: func(key: string) -> result<bool, handler-error>;
+
+  /// Lists keys by prefix at the event's snapshot fence, bounded by limit.
+  %list: func(prefix: string, limit: u32) -> result<list<string>, handler-error>;
+
+  /// Executes one SQL statement against the DO's relational surface inside
+  /// the event's transaction, with rows encoded as one JSON array of objects.
+  sql-rows: func(statement: string) -> result<string, handler-error>;
+
+  /// Stages logical JSON records for one configured Stream in this event's
+  /// transaction. The host assigns deterministic source event identities.
+  stream-send: func(stream-binding: string, stream-name: string, records: string) -> result<_, handler-error>;
+
+  /// Sets or replaces the DO's single durable alarm. Committed with the
+  /// event's transaction; the platform wakes the DO at the deadline.
+  set-alarm: func(epoch-millis: u64) -> result<_, handler-error>;
+
+  /// Reads the currently armed alarm deadline, when one exists.
+  get-alarm: func() -> result<option<u64>, handler-error>;
+
+  /// Clears the durable alarm inside the event's transaction.
+  delete-alarm: func() -> result<_, handler-error>;
+}
+
+interface sockets {
+  use types.{websocket-id, handler-error};
+
+  /// Sends one message to an accepted WebSocket. Delivery is gated on the
+  /// event's transaction committing (output gate).
+  send: func(socket: websocket-id, message: list<u8>) -> result<_, handler-error>;
+
+  /// Closes one accepted WebSocket with a code and reason.
+  close: func(socket: websocket-id, code: u16, reason: string) -> result<_, handler-error>;
+
+  /// Persists a small attachment blob with the connection. Survives
+  /// hibernation; bounded by the host (16 KiB).
+  set-attachment: func(socket: websocket-id, value: list<u8>) -> result<_, handler-error>;
+
+  /// Reads the most recent attachment for the connection.
+  get-attachment: func(socket: websocket-id) -> result<option<list<u8>>, handler-error>;
+
+  /// Lists every WebSocket currently attached to this DO.
+  attached: func() -> result<list<websocket-id>, handler-error>;
+}
+
+interface worker {
+  use types.{request, response, handler-error};
+
+  /// Handles one stateless Worker-tier HTTP request.
+  fetch: func(request: request) -> result<response, handler-error>;
+
+  /// Handles one stateless Worker cron event at its logical UTC deadline.
+  scheduled: func(scheduled-epoch-millis: u64, cron: string) -> result<_, handler-error>;
+}
+
+interface bindings {
+  use types.{request, response, handler-error};
+
+  /// Routes one flattened Durable Object stub fetch through the host.
+  do-fetch: func(binding: string, object: string, request: request) -> result<response, handler-error>;
+}
+
+interface handler {
+  use types.{request, response, websocket-id, handler-error};
+
+  /// Called once per component instantiation before its first event. A failing
+  /// init fails the wake and admits no event.
+  init: func() -> result<_, handler-error>;
+
+  /// Handles one HTTP request routed to this DO.
+  fetch: func(request: request) -> result<response, handler-error>;
+
+  /// Handles the DO's durable alarm firing at its committed deadline.
+  alarm: func(scheduled-epoch-millis: u64) -> result<_, handler-error>;
+
+  /// Handles one message from an accepted WebSocket.
+  websocket-message: func(socket: websocket-id, message: list<u8>) -> result<_, handler-error>;
+
+  /// Handles one WebSocket closing.
+  websocket-close: func(socket: websocket-id, code: u16, reason: string) -> result<_, handler-error>;
+}
+
+// Extension point: later revisions add `wasi:clocks/wall-clock` and a
+// host-bounded outbound `wasi:http` import here. Both are capabilities the
+// host must meter (deterministic replay, egress policy), so they land only
+// with their host-side enforcement. Worker-tier execution deliberately grants
+// no storage or socket capability.
+world service {
+  import storage;
+  import sockets;
+  import bindings;
+  export worker;
+  export handler;
+}

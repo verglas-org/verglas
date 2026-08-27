@@ -1,0 +1,16 @@
+{
+  "name": "verglas-graph",
+  "main": "worker.js",
+  "compatibility_date": "2026-08-26",
+  "durable_objects": {
+    "bindings": [
+      { "name": "GRAPH_DO", "class_name": "Graph" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Graph"] }
+  ],
+  "vars": {
+    "GRAPH_NAME": "knowledge"
+  }
+}

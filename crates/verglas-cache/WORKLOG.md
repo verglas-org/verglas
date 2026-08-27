@@ -536,3 +536,12 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   DRAM and NVMe by design, which is the stronger isolation test).
   Reproduced the failure locally under 100 busy-loop hogs (2/12 rounds),
   then 0/16 rounds with the barriers.
+- #cache-cleanup: Reduced the crate to one Foyer DRAM and persistent origin
+  cache with ETag/geometry block keys, admission, recovery, singleflight fills,
+  invalidation, and focused counters. Removed peer, write, materialized, and
+  retired-object machinery so cache state is local and disposable.
+- #cache-cleanup: Added focused behavior coverage for range slicing, DRAM and
+  NVMe hits, ETag isolation, invalidation/refill, concurrent fill coalescing,
+  and hard DRAM/NVMe budget rejection.
+- #171: Removed the final block-geometry comment promising future peer transfer. The retained Foyer cache geometry now describes only local admission, eviction, and origin fills.
+- #175: Added a small local-state record inside the existing Foyer engine for disposable Turso recovery cursors. SQL pages and Iceberg objects continue to share one cache authority; no second local database or cache directory was introduced.

@@ -205,3 +205,16 @@
   both go through the separate `time_travel_context` path, which registers
   one table directly and never touches this session config). New test:
   `tests/table_verbs.rs::unqualified_table_name_resolves_in_the_default_namespace`.
+
+- #PP6: Added the Sink-owned exactly-once Iceberg commit engine. It creates and
+  owns bounded-inferred tables, writes deterministic Parquet with validated
+  compression, records batch identity in snapshot metadata, and safely replays
+  orphaned data files after a lost catalog response; `tests/sink_commit.rs`
+  covers ownership, codecs, idempotency, and the crash seam.
+
+- #171: Slimmed this crate to the narrow Sink/Catalog capability. Deleted the
+  custom query, ingest, async-ingest WAL, compaction, retention, inspection,
+  reporting, and estimate surfaces and their obsolete dependencies. The retained
+  path infers bounded primitive schemas, writes deterministic Parquet files, and
+  returns replay-safe Iceberg snapshot receipts.
+- #171: Corrected the retained catalog connection contract: host-owned origin publication is authoritative, while local Foyer contents are disposable acceleration and never a write-back authority.

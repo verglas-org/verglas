@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  RimeStateStore,
-  VerglasGraphStore,
-  compileCandidateContext,
-} from "../src/index.mjs";
+import { RimeStateStore, compileCandidateContext } from "../src/index.mjs";
 
 const buggy = (error = "failed") => ({ status: "buggy", error });
 const worker = {
@@ -191,67 +187,6 @@ test("closed waves expose separate candidate and attempt matrices", async () => 
   });
   assert.equal(Object.isFrozen(snapshot.candidateMatrix), true);
   assert.equal(Object.isFrozen(snapshot.attemptMatrix), true);
-});
-
-test("Verglas graph writes normalized evidence and closes the wave last", async () => {
-  const calls = [];
-  const graph = {
-    create: async () => calls.push(["create"]),
-    insertNodes: async (nodes) => calls.push(["nodes", nodes]),
-    insertEdges: async (edges) => calls.push(["edges", edges]),
-  };
-  const store = new VerglasGraphStore({ graph, runId: "run-3" });
-  await store.initialize(root);
-  await store.openWave({
-    id: "wave-0",
-    ordinal: 0,
-    operation: "draft",
-    parentId: "candidate-0",
-    attempts: [
-      { ...worker, id: "attempt-0", ordinal: 0, workspaceId: "workspace-one" },
-    ],
-  });
-  await store.recordAttempt({
-    waveId: "wave-0",
-    attemptId: "attempt-0",
-    candidate,
-    runtime: { ...observedRuntime, startedAt: 10, finishedAt: 20 },
-  });
-  await store.closeWave("wave-0");
-
-  const nodes = calls
-    .filter(([kind]) => kind === "nodes")
-    .flatMap(([, values]) => values);
-  const edges = calls
-    .filter(([kind]) => kind === "edges")
-    .flatMap(([, values]) => values);
-  assert.deepEqual(
-    nodes.map(({ labels }) => labels[0]),
-    [
-      "RimeRun",
-      "RimeCandidate",
-      "RimeEvaluation",
-      "RimeWave",
-      "RimeAttempt",
-      "RimeWorkspace",
-      "RimeCandidate",
-      "RimeEvaluation",
-      "RimeGateEvaluation",
-      "RimeMetricMeasurement",
-      "RimeMetricMeasurement",
-      "RimeMetricMeasurement",
-      "RimeArtifact",
-      "RimeWaveClosed",
-    ],
-  );
-  assert.equal(
-    nodes.find(({ labels }) => labels[0] === "RimeCandidate").properties.gates,
-    undefined,
-  );
-  assert.ok(edges.some(({ predicate }) => predicate === "has_evaluation"));
-  assert.ok(edges.some(({ predicate }) => predicate === "has_gate"));
-  assert.ok(edges.some(({ predicate }) => predicate === "supported_by"));
-  assert.equal(edges.at(-1).predicate, "closed_by");
 });
 
 test("state snapshots hydrate without exposing an unfinished wave", async () => {

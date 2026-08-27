@@ -1,0 +1,10 @@
+{
+  "name": "@verglas/system-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "devDependencies": {
+    "@verglas/worker-js": "^0.1.0",
+    "esbuild": "0.28.2"
+  }
+}

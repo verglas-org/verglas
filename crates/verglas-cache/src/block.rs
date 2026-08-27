@@ -5,8 +5,8 @@
 //! # Data-block geometry
 //!
 //! A configured data-block size is the unit of caching, admission, eviction,
-//! backend fills, and (later) peer transfer. It echoes through range-serving,
-//! the future miss-ratio-curve math, and the benchmark suite, so the rationale
+//! and backend fills. It echoes through range-serving, the future
+//! miss-ratio-curve math, and the benchmark suite, so the rationale
 //! is recorded here once:
 //!
 //! - **Fill economics.** A cold read costs at most one origin GET of the
@@ -18,9 +18,9 @@
 //! - **DRAM granularity.** Smaller data blocks make the DRAM tier a finer hot
 //!   set; the configured geometry is carried into every budget calculation so
 //!   the hard ceiling remains exact.
-//! - **Disk layout.** The foyer disk engine's block (its eviction unit) is
-//!   sized in the engine module to hold exactly one configured cache block
-//!   plus entry framing, so eviction granularity == cache-block granularity.
+//! - **Disk layout.** Foyer packs logical cache entries into larger physical
+//!   eviction segments. The engine chooses that segment geometry independently
+//!   so a 1 MiB logical block does not create hundreds of 1 MiB files.
 //! - **Power of two.** Block index and intra-block offset are shift/mask
 //!   operations, and MRC bucket math (issue #62 territory) stays exact.
 //!

@@ -43,7 +43,6 @@ fn empty_snapshot() -> MetricsSnapshot {
         breaker_trips: 0,
         breaker_rejections: 0,
         breaker_state: "closed",
-        writeback: None,
     }
 }
 

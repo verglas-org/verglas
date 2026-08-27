@@ -107,8 +107,6 @@ pub enum ServedTier {
     Dram,
     /// Served from the local disk (NVMe) tier.
     Nvme,
-    /// Served from a peer node's cache over the peer-fetch rung (#29).
-    Peer,
     /// Served from a backend cache-fill (a miss that fetched and admitted).
     Backend,
     /// Served straight through the direct-to-origin passthrough (no cache in
@@ -123,7 +121,6 @@ impl ServedTier {
         match self {
             ServedTier::Dram => "dram",
             ServedTier::Nvme => "nvme",
-            ServedTier::Peer => "peer",
             ServedTier::Backend => "backend",
             ServedTier::Passthrough => "passthrough",
         }
@@ -134,9 +131,8 @@ impl ServedTier {
         match self {
             ServedTier::Dram => 0,
             ServedTier::Nvme => 1,
-            ServedTier::Peer => 2,
-            ServedTier::Backend => 3,
-            ServedTier::Passthrough => 4,
+            ServedTier::Backend => 2,
+            ServedTier::Passthrough => 3,
         }
     }
 
@@ -146,9 +142,8 @@ impl ServedTier {
     fn from_u8(v: u8) -> Self {
         match v {
             1 => ServedTier::Nvme,
-            2 => ServedTier::Peer,
-            3 => ServedTier::Backend,
-            4 => ServedTier::Passthrough,
+            2 => ServedTier::Backend,
+            3 => ServedTier::Passthrough,
             _ => ServedTier::Dram,
         }
     }

@@ -2,8 +2,8 @@
 //! (`GetObject`/`HeadObject`) on top of the [`ObjectRead`] interface and the write
 //! surface (`PutObject`, `DeleteObject`(s), `CopyObject`, the multipart
 //! lifecycle) on top of the [`ObjectWrite`] interface, exposing the whole thing as
-//! an axum router the server can bind to `listen.s3_port`. s3s owns request
-//! parsing, error XML rendering, and status codes; this module owns the
+//! an axum router for an owning HTTP host to mount. s3s owns request parsing,
+//! error XML rendering, and status codes; this module owns the
 //! mapping between S3 semantics and the interfaces — including the write path's
 //! ordering invariant: backend durable, then invalidation, then (and only
 //! then) the client ack.
@@ -244,7 +244,7 @@ fn retain_response_budget(body: BodyStream, permit: OwnedSemaphorePermit) -> Bod
 
 /// Emits the single INFO completion line for one request (#61): op, key tier,
 /// HTTP status, and duration, tagged with the current request id so the line
-/// correlates with the front-end span, the peer hop, and any fill events. One
+/// correlates with the front-end span and any local fill events. One
 /// event per request; the fields are cheap and the macro compiles to a level
 /// check when INFO is disabled, so the hot path pays nothing beyond that check.
 /// The object key is never logged, only its serving tier — key redaction (#61).

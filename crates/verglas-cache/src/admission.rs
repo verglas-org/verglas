@@ -220,8 +220,8 @@ impl CountMinSketch {
         }
     }
 
-    /// Zeroes every counter and the window — a cold reset, used when the cache
-    /// is purged so post-purge admission starts from a clean frequency slate.
+    /// Zeroes every counter and the window for the admission unit tests.
+    #[cfg(test)]
     fn clear(&self) {
         self.additions.store(0, Ordering::Relaxed);
         for counter in self.counters.iter() {
@@ -317,10 +317,8 @@ impl Admission {
         }
     }
 
-    /// Records a partial-read candidate and returns whether it has demonstrated
-    /// enough reuse to justify aligned background overfetch. This doorkeeper is
-    /// independent of occupancy: user-requested exact bytes flow on first
-    /// sight, while only repeated blocks spend extra origin bandwidth.
+    /// Records a partial-read candidate for the admission unit tests.
+    #[cfg(test)]
     pub(crate) fn repeated(&self, key: &BlockEntryKey) -> bool {
         !self.enabled || self.sketch.increment_and_estimate(hash_key(key)) >= self.threshold
     }
@@ -351,21 +349,8 @@ impl Admission {
         (prev % PROBABILITY_SCALE) + self.admit_probability_ppm >= PROBABILITY_SCALE
     }
 
-    /// Rebases the pressure proxy after a live resize changed resident
-    /// reality (#223 follow-up): a shrink evicted blocks the cumulative proxy
-    /// still counts, so it is set to the store's actual physical occupancy.
-    /// Without this, a deep shrink leaves `under_pressure()` permanently true
-    /// and every later one-touch fill is rejected against blocks that no
-    /// longer exist. The frequency sketch is deliberately kept — access
-    /// history survives a resize; only the byte proxy rebases.
-    pub(crate) fn rebase_pressure(&self, resident_bytes: u64) {
-        self.admitted_bytes.store(resident_bytes, Ordering::Relaxed);
-    }
-
-    /// Resets the pressure proxy, frequency sketch, and probabilistic-admitter
-    /// accumulator to cold — called when the cache is purged (#138) so a
-    /// repeat-cold leg starts admitting freely again, exactly as a fresh server
-    /// would.
+    /// Resets the policy for the admission unit tests.
+    #[cfg(test)]
     pub(crate) fn reset(&self) {
         self.admitted_bytes.store(0, Ordering::Relaxed);
         self.admit_accumulator.store(0, Ordering::Relaxed);
@@ -411,7 +396,6 @@ mod tests {
                 block_bytes: BLOCK_SIZE_BYTES,
                 block_index: index,
             },
-            generation: 0,
         }
     }
 

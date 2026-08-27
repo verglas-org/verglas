@@ -9,9 +9,7 @@ publish.workspace = true
 [dependencies]
 verglas-core.workspace = true
 verglas-backend.workspace = true
-verglas-graph.workspace = true
-verglas-iceberg.workspace = true
-verglas-vector.workspace = true
+verglas-cache.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64 = "0.22.1"
@@ -24,10 +22,6 @@ percent-encoding = "2.3.2"
 hmac = "0.12.1"
 hex.workspace = true
 sha2.workspace = true
-# Fire-and-forget publisher for semantic mutation events (R7-A); already a
-# workspace dependency used by several other crates and by this crate's own
-# dev-dependencies, so no new dependency enters the tree.
-reqwest.workspace = true
 s3s.workspace = true
 sync_wrapper.workspace = true
 http-body-util = "0.1.3"
@@ -35,10 +29,10 @@ tower = "0.5.2"
 tracing = "0.1.44"
 tokio.workspace = true
 serde_json.workspace = true
-iceberg.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+reqwest.workspace = true
 hex = "0.4.3"
 hmac = "0.12.1"
 percent-encoding = "2.3.2"
@@ -46,21 +40,11 @@ percent-encoding = "2.3.2"
 sha2 = "0.10.9"
 tokio.workspace = true
 tempfile.workspace = true
-urlencoding = "2.1.3"
-# Captures the request-completion events for the #61 trace-id test.
+# Captures request-completion events for the trace-id test.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }
 serde_json.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
-
-[[test]]
-name = "semantic_event_publish"
-path = "tests/semantic_event_publish.rs"
-# Frozen acceptance test (R7-A): it calls std::env::set_var/remove_var
-# unwrapped, which is only sound to call without `unsafe` under edition 2021
-# semantics on this toolchain (edition 2024 requires an unsafe block). This
-# is the file's own edition choice, scoped to just this test binary; it does
-# not change the edition of the crate under test.
-edition = "2021"
+urlencoding = "2.1.3"
 
 [lints]
 workspace = true

@@ -154,3 +154,8 @@
   `verglas-server`. Backend resolution and startup probing are unchanged.
 - #66: Replaced “which cloud” / “real cloud” wording with object-store language in backend docs.
 - #84: Added a fail-closed dynamic registry that routes immutable storage bindings to independent backend clients and applies inserts or removals without a cache restart. Each binding retains its own provider, limiter, breaker, and retry state while the cache above remains shared.
+- #core-cleanup: Moved the small bucket glob matcher into the backend crate before
+  deleting the unused core glob module. Bucket-set matching remains exact and
+  allocation-bounded without retaining cache-node configuration helpers.
+- #171: Corrected public backend documentation links so strict workspace rustdoc resolves only public items and the owning factory method. Runtime behavior is unchanged.
+- #171: Added an exact logical-to-physical bucket adapter for cloud Durable Objects. Precompiled Workers can retain one stable `s3://lake` contract while every deployment routes that name to its own provider bucket without widening the binding or bucket authority.

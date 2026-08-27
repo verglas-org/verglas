@@ -1,4 +1,4 @@
-//! Memory budgets shared by independently deployed engine roles.
+//! Memory budgets shared by independently deployed runtime roles.
 //!
 //! A role asks its launcher for a byte budget before expensive work begins.
 //! The contract does not prescribe the enforcement mechanism; hosted launchers

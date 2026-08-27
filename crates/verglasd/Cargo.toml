@@ -1,0 +1,26 @@
+[package]
+name = "verglasd"
+description = "Host-level process and lifecycle supervisor for Durable Objects"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["multipart"] }
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["process", "sync", "fs", "time", "net", "io-util", "signal", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+tokio = { workspace = true, features = ["test-util", "time"] }
+
+[lints]
+workspace = true

@@ -316,4 +316,16 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   JSON file rather than a viewer. The cache node's admin listener now serves
   every specification, including this crate's S3/graph/vector contract.
 - #137: Renamed the Graph REST-JSON operations to conventional Graphiti-derived verbs: add nodes and edges, retrieve neighbors, search traversals, describe graphs, and build indexes. The adapter, route contract, generated clients, and protocol tests now share the new names; the former ad-hoc routes are not served.
-
+- #s3-cleanup: Reduced this crate to strict authenticated S3 frontend and
+  passthrough origin read/write/list adapters. Removed semantic graph, vector,
+  and Iceberg routes, models, tests, and dependencies.
+- #171: Removed the final write-back fragment field from the S3 metrics fixture after deleting that retired distributed-storage metric family from core.
+- #s3-cleanup: Added a static public-surface guard proving semantic mutation
+  routes and dispatch remain absent after the passthrough-only reduction.
+- #171: Deleted the orphaned generated S3 Vector service model after removing its routes and Rust types. The retained crate contains only the S3-compatible object surface used by runtime infrastructure.
+- #171: Removed stale peer-hop, ring-routing, and cluster-of-one wording from the local S3 request, completion, and multipart paths. Request correlation remains scoped only to one runtime's cache and origin diagnostics.
+- #171: Added a one-bucket S3 proxy host for cloud Durable Objects. It accepts only preprovisioned bucket coordinates and separate origin/client credential files, so a Catalog object can expose its own SigV4 endpoint without receiving provider credentials.
+- #171: Removed the stale service-contract README left after deleting the generated
+  S3 OpenAPI document. Mintlify no longer attempts to load that nonexistent
+  legacy contract from the documentation configuration.
+- #175: Tightened the per-object S3 proxy startup contract and kept its reads on the shared Foyer path. The proxy exposes only the logical bucket and object-scoped client credentials while provider coordinates remain host-owned.

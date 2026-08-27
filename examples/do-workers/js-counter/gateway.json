@@ -1,0 +1,23 @@
+{
+  "name": "js-counter",
+  "main": "worker.js",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COUNTER",
+        "class_name": "Counter"
+      }
+    ]
+  },
+  "artifacts": {
+    "worker": {
+      "digest": "ce2015441737039e407dcbdcacfc639bf1fd4094f90211c8297a5d81c06d89d5",
+      "component_dir": "/var/folders/yx/9xsd5bx57m3d_q76q7lz4r4c0000gn/T/verglas-cloud-worker-C5H9SG"
+    },
+    "durable_object": {
+      "digest": "ce2015441737039e407dcbdcacfc639bf1fd4094f90211c8297a5d81c06d89d5",
+      "component_dir": "/var/folders/yx/9xsd5bx57m3d_q76q7lz4r4c0000gn/T/verglas-cloud-worker-C5H9SG"
+    }
+  },
+  "data_root": "/tmp/verglas-do-poc/js-data"
+}

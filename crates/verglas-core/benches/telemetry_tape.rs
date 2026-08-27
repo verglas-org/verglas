@@ -3,7 +3,7 @@
 //! Release-blocking discipline: the serving path must add near-zero cost. This
 //! benchmark measures exactly what a served read pays to record its access — one
 //! [`Telemetry::record`] (thread-local shard lookup + one tape append). It does
-//! NOT include `classify()` (measured in verglas-tables' `classify` bench) or
+//! NOT include `classify()` (measured in a separate classification bench) or
 //! body streaming; it isolates the tape write itself.
 //!
 //! Run with `cargo bench -p verglas-core --bench telemetry_tape`. The expected

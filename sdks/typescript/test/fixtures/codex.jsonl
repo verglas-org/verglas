@@ -1,7 +1,0 @@
-{"type":"session_meta","payload":{"id":"cx-1","timestamp":"2026-07-02T09:00:00.000Z","cwd":"/repo","git":{"branch":"main"}}}
-{"type":"turn_context","payload":{"model":"gpt-5-codex"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list the repo files"}]},"timestamp":"2026-07-02T09:00:01.000Z"}
-{"type":"event_msg","payload":{"type":"agent_reasoning","text":"I should run ls to see the files."},"timestamp":"2026-07-02T09:00:02.000Z"}
-{"type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"exec_command","arguments":"{\"cmd\":\"ls\"}"},"timestamp":"2026-07-02T09:00:03.000Z"}
-{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"README.md"},"timestamp":"2026-07-02T09:00:04.000Z"}
-{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"There is one file: README.md."}]},"timestamp":"2026-07-02T09:00:05.000Z"}

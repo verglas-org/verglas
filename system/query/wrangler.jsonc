@@ -1,0 +1,19 @@
+{
+  "name": "verglas-query",
+  "main": "worker.js",
+  "compatibility_date": "2026-08-26",
+  "durable_objects": { "bindings": [{ "name": "QUERY_DO", "class_name": "Query" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Query"] }],
+  "vars": {
+    "QUERY_NAME": "analytics",
+    "QUERY_DEFINITION": {
+      "sources": [{ "name": "orders" }],
+      "views": [{
+        "name": "daily_sales", "source": "orders",
+        "dimensions": [{ "name": "day", "field": "day" }, { "name": "region", "field": "region" }],
+        "measures": [{ "name": "revenue", "op": "sum", "field": "amount" }, { "name": "orders", "op": "count" }]
+      }],
+      "endpoints": [{ "name": "sales_by_day", "view": "daily_sales", "params": [], "order_by": [{ "field": "day", "direction": "asc" }], "limit": 100 }]
+    }
+  }
+}

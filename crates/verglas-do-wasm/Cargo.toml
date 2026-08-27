@@ -1,0 +1,23 @@
+[package]
+name = "verglas-do-wasm"
+description = "Durable Object Worker ABI and Wasmtime host execution scaffolding"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wat.workspace = true
+
+[lints]
+workspace = true

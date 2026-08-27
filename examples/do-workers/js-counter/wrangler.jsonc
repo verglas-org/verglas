@@ -1,0 +1,10 @@
+{
+  "name": "js-counter",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" }
+    ]
+  }
+}

@@ -656,8 +656,8 @@ pub struct PassthroughWrite {
     /// ListParts (`object_store` cannot forward it). Every other multipart
     /// operation is stateless: upload IDs are the backend's own, so
     /// UploadPart/Complete/Abort work even for uploads this map has never
-    /// seen. M1 is a cluster of one, so an upload ID missing here means the
-    /// upload does not exist — except across a server restart, where
+    /// seen. An upload ID missing here means the upload does not exist — except
+    /// across a runtime restart, where
     /// ListParts (only) forgets live uploads until the backend client forwards
     /// it natively. Keyed by upload ID alone; the tracked entry carries the
     /// bucket so an ID cannot be replayed against the wrong bucket.
@@ -1397,7 +1397,7 @@ impl ObjectWrite for PassthroughWrite {
 
     /// Forwards the completion manifest. Both completion APIs are positional
     /// (part `i` of the vec must be part number `i+1`), so non-contiguous part
-    /// numbers are rejected by [`contiguous_parts`] instead of being silently
+    /// numbers are rejected by the contiguous-part validator instead of being silently
     /// renumbered — renumbering would make the origin verify the wrong ETags.
     /// Real S3 clients number parts 1..=N. A checksummed completion (per-part
     /// or object-level, issue #208), or a raw-only key (issue #189), completes

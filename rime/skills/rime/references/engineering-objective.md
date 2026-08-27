@@ -42,7 +42,7 @@ Freeze the evaluator before search:
 4. Reset caches and state when the production workload does not reuse them. Preserve realistic caches when it does.
 5. Reserve held-out cases for retrieval, model, prompt, or heuristic systems. Do not select candidates on the same examples used to author them.
 6. Keep hardware, concurrency, dataset, dependency versions, and measurement boundaries fixed across candidates.
-7. Store raw benchmark artifacts outside the graph and persist their identities and summaries with each measurement.
+7. Store raw benchmark artifacts outside the search state and persist their identities and summaries with each measurement.
 
 Reject objectives that can be gamed by skipping work, returning cached constants, shrinking the evaluated dataset, weakening correctness tolerance, or moving work outside the measured boundary.
 
@@ -50,6 +50,6 @@ Reject objectives that can be gamed by skipping work, returning cached constants
 
 For database query performance, keep result equivalence and software-quality gates hard. Rank p95 latency and throughput, optionally include CPU or cost, and constrain peak memory and error rate.
 
-For graph RAG, gate on held-out correctness and provenance. Rank retrieval recall, answer faithfulness, and coverage while constraining p95 latency and cost per query. Keep ingestion quality and online query quality as separate metrics rather than one opaque judge score.
+For retrieval systems, gate on held-out correctness and provenance. Rank retrieval recall, answer faithfulness, and coverage while constraining p95 latency and cost per query. Keep ingestion quality and online query quality as separate metrics rather than one opaque judge score.
 
 The default coding profile is itself a general objective: maximize task and architectural utility while minimizing change-surface utility, after every software gate passes.

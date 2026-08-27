@@ -229,8 +229,7 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
 # The Verglas fork replaced lakekeeper/iceberg-rust as the iceberg source so
-# that this workspace and the engine workspace at the repository root resolve
-# one `iceberg`. The fork's base is that same rev.
+# that this workspace resolves one `iceberg`. The fork's base is that same rev.
 allow-git = ["https://github.com/verglas-org/verglas-iceberg"]
 
 [sources.allow-org]

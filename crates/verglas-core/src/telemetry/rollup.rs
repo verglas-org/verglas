@@ -301,7 +301,7 @@ fn resolve_name<F: Fn(u32) -> Option<String>>(id: u32, resolve: &F) -> String {
 pub struct TableMetricRow {
     /// Resolved table name (`_unmapped` / `_overflow` for the sentinels).
     pub table: String,
-    /// Reads served from a cache tier (dram/nvme/peer).
+    /// Reads served from a local cache tier (DRAM/NVMe).
     pub hits: u64,
     /// Reads that had to fill from the backend.
     pub misses: u64,
@@ -400,7 +400,7 @@ mod tests {
             event(1, Tier::Dram, 100, 50),
             event(1, Tier::Nvme, 200, 80),
             event(1, Tier::Backend, 400, 5000),
-            event(2, Tier::Peer, 50, 60),
+            event(2, Tier::Passthrough, 50, 60),
         ]);
         let report = r.report(no_names);
         let t1 = report
@@ -415,8 +415,8 @@ mod tests {
         assert_eq!(t1.requests_avoided, 2);
         assert!((t1.hit_rate() - 2.0 / 3.0).abs() < 1e-9);
         // Fleet totals reconcile.
-        assert_eq!(report.totals.hits, 3);
-        assert_eq!(report.totals.requests_avoided, 3);
+        assert_eq!(report.totals.hits, 2);
+        assert_eq!(report.totals.requests_avoided, 2);
     }
 
     #[test]

@@ -1,0 +1,20 @@
+//! OSS Durable Object gateway for wrangler-style manifests.
+//!
+//! The library owns HTTP and WebSocket connections, launches one resident DO
+//! through verglasd, and exchanges frozen NDJSON events over its private socket.
+
+mod connection;
+mod error;
+mod gateway;
+mod manifest;
+mod protocol;
+mod spawn;
+
+pub use error::GatewayError;
+pub use gateway::{Gateway, WorkerExecutor, WorkerPoolExecutor};
+pub use manifest::{
+    ArtifactDescriptor, ArtifactProduct, Binding, GraphBinding, HostServiceBinding, Manifest,
+    ManifestError, Migration, PipelineBinding, QueryBinding, SystemBinding, VectorizeBinding,
+};
+pub use spawn::{DoSpawner, SpawnRequest, VerglasdSpawner};
+pub use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};
